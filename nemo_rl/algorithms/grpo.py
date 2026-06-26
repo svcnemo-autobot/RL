@@ -1223,6 +1223,8 @@ def setup(
     # print the node IP and GPU ID of the policy workers for debugging
     policy.print_node_ip_and_gpu_id()
 
+    nccl_reshard_refit_enabled = policy_config.get("nccl_reshard_refit", False)
+
     # if it is not colocated inference, initialize collective communication for update weights
     if not colocated_inference:
         t0 = time.perf_counter()
@@ -1253,6 +1255,24 @@ def setup(
                 refit_backend=refit_backend,
             )
             ray.get(futures_train + futures_inference)
+        elif nccl_reshard_refit_enabled:
+            from nemo_rl.weight_sync.factory import create_weight_synchronizer
+            from nemo_rl.weight_sync.nccl_reshard_utils import (
+                check_nccl_reshard_refit_support,
+            )
+
+            check_nccl_reshard_refit_support(master_config)
+
+            weight_synchronizer = create_weight_synchronizer(
+                policy=policy,
+                generation=policy_generation,
+                generation_backend=backend,
+                colocated=False,
+                train_cluster=train_cluster,
+                inference_cluster=inference_cluster,
+                nccl_reshard_refit=True,
+            )
+            weight_synchronizer.init_communicator()
         else:
             futures_train = policy.init_collective(
                 ip, port, world_size, train_world_size=train_world_size
@@ -1263,9 +1283,10 @@ def setup(
             ray.get(futures_train + futures_inference)
         worker_init_timing_metrics["collective_init_time_s"] = time.perf_counter() - t0
 
-    state_dict_info = policy.prepare_refit_info()
-    if policy_generation is not None:
-        policy_generation.prepare_refit_info(state_dict_info)
+    if not (nccl_reshard_refit_enabled and not colocated_inference):
+        state_dict_info = policy.prepare_refit_info()
+        if policy_generation is not None:
+            policy_generation.prepare_refit_info(state_dict_info)
 
     # Spin up non-colocated OPD teacher worker groups AFTER policy / vLLM are
     # ready. Parallelizing with policy init races on Megatron-Bridge's HF->mcore
@@ -2007,6 +2028,7 @@ def refit_policy_generation(
     _refit_buffer_size_gb: Optional[float] = None,
     timer: Optional[Timer] = None,
     kv_scales: Optional[dict[str, float]] = None,
+    nccl_reshard_refit: bool = False,
 ) -> None:
     """Refit the policy generation interface with the latest policy weights.
 
@@ -2086,17 +2108,30 @@ def refit_policy_generation(
                 raise NotImplementedError(
                     "SGLang haven't implemented non-colocated inference mode. "
                 )
-            if isinstance(policy_generation, MegatronGeneration):
-                futures_train = policy.swap_weights_via_reshard(is_source=True)
-            else:
-                futures_train = policy.broadcast_weights_for_collective(
-                    kv_scales=kv_scales
+            if nccl_reshard_refit:
+                from nemo_rl.weight_sync.nccl_reshard_weight_synchronizer import (
+                    NcclReshardWeightSynchronizer,
                 )
-            futures_inference = policy_generation.update_weights_from_collective()
-            # wait for all futures to complete
-            ray.get(futures_train)
-            results = ray.get(futures_inference)
-            update_success = all(result for result in results if result is not None)
+
+                NcclReshardWeightSynchronizer(
+                    policy=policy,
+                    generation=policy_generation,
+                    train_cluster=None,
+                    inference_cluster=None,
+                ).sync_weights(kv_scales=kv_scales)
+                update_success = True
+            else:
+                if isinstance(policy_generation, MegatronGeneration):
+                    futures_train = policy.swap_weights_via_reshard(is_source=True)
+                else:
+                    futures_train = policy.broadcast_weights_for_collective(
+                        kv_scales=kv_scales
+                    )
+                futures_inference = policy_generation.update_weights_from_collective()
+                # wait for all futures to complete
+                ray.get(futures_train)
+                results = ray.get(futures_inference)
+                update_success = all(result for result in results if result is not None)
 
         # check if update is successful
         if not update_success:
@@ -2336,6 +2371,11 @@ def grpo_train(
     colocated_inference = master_config.policy["generation"]["colocated"]["enabled"]
     refit_buffer_size_gb = master_config.policy.get("refit_buffer_size_gb")
 
+    nccl_reshard_refit_enabled = (
+        master_config.policy.get("nccl_reshard_refit", False)
+        and not colocated_inference
+    )
+
     # Initialize advantage estimator
     adv_estimator = _create_advantage_estimator(master_config)
 
@@ -2351,6 +2391,7 @@ def grpo_train(
                 policy_generation,
                 colocated_inference,
                 _refit_buffer_size_gb=refit_buffer_size_gb,
+                nccl_reshard_refit=nccl_reshard_refit_enabled,
             )
             POLICY_GENERATION_STALE = False
         else:
@@ -2468,6 +2509,7 @@ def grpo_train(
                             _refit_buffer_size_gb=refit_buffer_size_gb,
                             timer=timer,
                             kv_scales=kv_scales_cache if sync_kv_scales else None,
+                            nccl_reshard_refit=nccl_reshard_refit_enabled,
                         )
                         POLICY_GENERATION_STALE = False
                     else:
@@ -2918,6 +2960,7 @@ def grpo_train(
                             colocated_inference,
                             _refit_buffer_size_gb=refit_buffer_size_gb,
                             kv_scales=kv_scales_cache if sync_kv_scales else None,
+                            nccl_reshard_refit=nccl_reshard_refit_enabled,
                         )
                         POLICY_GENERATION_STALE = False
                     else:
@@ -3576,7 +3619,10 @@ def async_grpo_train(
     val_at_start = master_config.grpo["val_at_start"]
     val_at_end = master_config.grpo["val_at_end"]
     colocated_inference = master_config.policy["generation"]["colocated"]["enabled"]
-
+    nccl_reshard_refit_enabled = (
+        master_config.policy.get("nccl_reshard_refit", False)
+        and not colocated_inference
+    )
     # Initialize advantage estimator
     adv_estimator = _create_advantage_estimator(master_config)
 
@@ -3593,7 +3639,7 @@ def async_grpo_train(
     # Ensure the buffer has at least one step worth of prompt-groups before training
     min_trajectories_needed = num_prompts_per_step
 
-    print("📊 Buffer requirements calculation:")
+    print("📊 Buffer requirements calculation:", flush=True)
     print(f"   - num_prompts_per_step: {num_prompts_per_step}")
     print(f"   - num_generations_per_prompt: {samples_per_prompt_group}")
     print(f"   - samples_per_prompt_group: {samples_per_prompt_group}")
@@ -3708,12 +3754,17 @@ def async_grpo_train(
         f"🚀 Starting async GRPO training with buffer_size={optimal_buffer_size}, max_age={max_trajectory_age_steps} steps"
     )
 
-    print("⏳ Preparing policy generation for training...")
+    print("⏳ Preparing policy generation for training...", flush=True)
     if NEED_REFIT and POLICY_GENERATION_STALE:
-        print("🔄 Refitting policy generation with actual model weights...")
+        print("🔄 Refitting policy generation with actual model weights...", flush=True)
         try:
-            refit_policy_generation(policy, policy_generation, colocated_inference)
-            print("✅ Policy generation refit completed successfully")
+            refit_policy_generation(
+                policy,
+                policy_generation,
+                colocated_inference,
+                nccl_reshard_refit=nccl_reshard_refit_enabled,
+            )
+            print("✅ Policy generation refit completed successfully", flush=True)
             POLICY_GENERATION_STALE = False
         except Exception as e:
             print(f"❌ Policy generation refit failed: {e}")
@@ -4157,6 +4208,7 @@ def async_grpo_train(
                             policy,
                             policy_generation,
                             colocated_inference,
+                            nccl_reshard_refit=nccl_reshard_refit_enabled,
                         )
                         POLICY_GENERATION_STALE = False
 
@@ -4185,7 +4237,10 @@ def async_grpo_train(
 
                         if NEED_REFIT and POLICY_GENERATION_STALE:
                             refit_policy_generation(
-                                policy, policy_generation, colocated_inference
+                                policy,
+                                policy_generation,
+                                colocated_inference,
+                                nccl_reshard_refit=nccl_reshard_refit_enabled,
                             )
                             POLICY_GENERATION_STALE = False
                         else:
