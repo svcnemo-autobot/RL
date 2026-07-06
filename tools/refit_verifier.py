@@ -104,6 +104,13 @@ def parse_args():
         help="Path to the model checkpoint",
     )
     parser.add_argument(
+        "--policy_config",
+        type=str,
+        default=None,
+        help="Optional recipe YAML to source a complete PolicyConfig (megatron_cfg) from; "
+        "overrides the stale hardcoded config. tp/ep/pp/seqlen still come from args.",
+    )
+    parser.add_argument(
         "--tp_size",
         type=int,
         default=1,
@@ -120,6 +127,26 @@ def parse_args():
         type=int,
         default=1,
         help="Pipeline parallelism size (PP) for Megatron",
+    )
+    parser.add_argument(
+        "--gpus_per_node",
+        type=int,
+        default=0,
+        help="Physical GPUs per node (e.g. 4 on GB200). 0 = single node with tp*ep*pp GPUs (original).",
+    )
+    parser.add_argument(
+        "--gpu_mem_util",
+        type=float,
+        default=0.3,
+        help="vLLM gpu_memory_utilization. With colocated offload set high (~0.85); policy is offloaded during gen.",
+    )
+    parser.add_argument(
+        "--vllm_ep_size",
+        type=int,
+        default=0,
+        help="vLLM expert_parallel_size. 0 = auto = full cluster (tp*ep*pp) so vLLM shards experts "
+        "across ALL colocated GPUs (EP=DP*TP). Decouples vLLM EP from Megatron's --ep_size; needed "
+        "for colocated because vLLM EP=DP*TP determines how many GPUs vLLM uses.",
     )
     parser.add_argument(
         "--max_new_tokens",
@@ -233,6 +260,18 @@ def setup_configs(args, tokenizer):
             "freeze_moe_router": False,
             "apply_rope_fusion": False,
             "gradient_accumulation_fusion": False,
+            # nemotron_h-required megatron_cfg keys (tool's static config predates them)
+            "moe_enable_deepep": False,
+            "moe_token_dispatcher_type": "alltoall",
+            "moe_shared_expert_overlap": False,
+            "use_gloo_process_groups": False,
+            "defer_fp32_logits": True,
+            "use_fused_weighted_squared_relu": True,
+            "first_last_layers_bf16": True,
+            "num_layers_at_start_in_bf16": 1,
+            "num_layers_at_end_in_bf16": 1,
+            "mtp_num_layers": 0,
+            "moe_router_enable_expert_bias": True,
             "optimizer": {
                 "optimizer": "adam",
                 "lr": 5.0e-6,
@@ -274,6 +313,41 @@ def setup_configs(args, tokenizer):
         },
     }
 
+    # Override the (stale) hardcoded megatron_config with a complete, current
+    # PolicyConfig from a recipe YAML when --policy_config is given.
+    if getattr(args, "policy_config", None):
+        register_omegaconf_resolvers()  # recipe uses ${mul:...} etc.
+        _r = load_config(args.policy_config)
+        OmegaConf.set_struct(_r, False)
+        for _k in ("env", "data", "checkpointing", "logger", "grpo", "loss_fn"):
+            if _k in _r:
+                del _r[_k]
+        _r = OmegaConf.to_container(_r, resolve=True)
+        megatron_config = _r["policy"]
+        megatron_config["model_name"] = args.model_name
+        megatron_config.setdefault("tokenizer", {})["name"] = args.model_name
+        megatron_config["max_total_sequence_length"] = args.max_sequence_length
+        _mc = megatron_config["megatron_cfg"]
+        _mc["tensor_model_parallel_size"] = args.tp_size
+        _mc["expert_model_parallel_size"] = args.ep_size
+        _mc["pipeline_model_parallel_size"] = args.pp_size
+        _mc["context_parallel_size"] = 1
+        _mc["train_iters"] = 1
+        if args.ep_size < 2:  # hybridep kernel needs >=2 EP ranks; alltoall works at 1
+            _mc["moe_token_dispatcher_type"] = "alltoall"
+        print(f"Using megatron_cfg from recipe: {args.policy_config}")
+
+    # vLLM expert parallelism: for colocated, vLLM must span the whole cluster
+    # (EP = DP*TP = total GPUs) so experts shard across every GPU (small per-GPU
+    # weight that coexists with the Megatron shard during refit). Megatron's own
+    # --ep_size only sizes the cluster; vLLM EP is decoupled here.
+    _total_gpus = args.tp_size * args.ep_size * args.pp_size
+    _vllm_ep = args.vllm_ep_size if getattr(args, "vllm_ep_size", 0) else _total_gpus
+    print(
+        f"vLLM expert_parallel_size={_vllm_ep} (DP={_vllm_ep // args.tp_size} x TP={args.tp_size}); "
+        f"Megatron expert_model_parallel_size={args.ep_size}"
+    )
+
     # vLLM Configuration (match new VllmGeneration expectations: TP/PP/EP provided separately)
     vllm_config = {
         "backend": "vllm",
@@ -291,8 +365,8 @@ def setup_configs(args, tokenizer):
         "vllm_cfg": {
             "tensor_parallel_size": args.tp_size,
             "pipeline_parallel_size": args.pp_size,
-            "expert_parallel_size": args.ep_size,
-            "gpu_memory_utilization": 0.6,
+            "expert_parallel_size": _vllm_ep,
+            "gpu_memory_utilization": args.gpu_mem_util,  # with offload, policy is not co-resident -> can be high
             "max_model_len": args.max_sequence_length,
             "precision": "bfloat16",
             "async_engine": False,
@@ -307,7 +381,10 @@ def setup_configs(args, tokenizer):
                 "num_nodes": None,
             },
         },
-        "vllm_kwargs": {},
+        # vLLM 0.20 allocates one Mamba cache block per decode seq; the default
+        # max_num_seqs=1024 exceeds available blocks for nemotron_h at modest util.
+        # The verifier only needs a handful of sequences.
+        "vllm_kwargs": {"max_num_seqs": 64},
     }
 
     # Configure vLLM with tokenizer
@@ -328,15 +405,35 @@ def setup_clusters_and_policies(args, megatron_config, vllm_config, tokenizer):
     Returns:
         tuple: (megatron_cluster, policy, vllm_inference_policy)
     """
-    gpus_per_node = args.tp_size * args.ep_size * args.pp_size
-    print(f"Setting up Megatron Cluster with TP={gpus_per_node}")
+    total_gpus = args.tp_size * args.ep_size * args.pp_size
+    phys = args.gpus_per_node if args.gpus_per_node else total_gpus
+    assert total_gpus % phys == 0, (
+        f"tp*ep*pp={total_gpus} must be divisible by gpus_per_node={phys}"
+    )
+    num_nodes = total_gpus // phys
+    print(f"Setting up Megatron Cluster: {total_gpus} GPUs = {num_nodes} node(s) x {phys}")
     megatron_cluster = RayVirtualCluster(
         name="megatron_cluster",
-        bundle_ct_per_node_list=[gpus_per_node],
+        bundle_ct_per_node_list=[phys] * num_nodes,
         use_gpus=True,
-        num_gpus_per_node=gpus_per_node,
+        num_gpus_per_node=phys,
         max_colocated_worker_groups=2,
     )
+
+    # vLLM needs tp*pp contiguous GPUs for one model-parallel group. When that
+    # exceeds the GPUs on a single node (e.g. tp8 on 4-GPU GB200 nodes), vLLM
+    # requires a UNIFIED placement group spanning nodes. The cluster caches its
+    # PGs on first use; Policy (Megatron) would otherwise create per-node PGs
+    # first, so vLLM's _init_placement_groups(use_unified_pg=True) would get the
+    # cached per-node PGs -> num_groups = gpus_per_node // (tp*pp) = 0 ->
+    # "Unable to allocate any worker groups". Pre-initialize the unified PG here
+    # so both Policy and vLLM share it. Megatron supports unified PGs too.
+    if args.tp_size * args.pp_size > phys:
+        print(
+            f"vLLM tp*pp={args.tp_size * args.pp_size} > gpus_per_node={phys}: "
+            "pre-initializing UNIFIED placement group for cross-node parallelism"
+        )
+        megatron_cluster._init_placement_groups(use_unified_pg=True)
 
     print("Instantiating Policy with Megatron backend...")
     policy = Policy(

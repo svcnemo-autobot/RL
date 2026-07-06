@@ -161,6 +161,10 @@ if [[ -z "$GPUS_PER_NODE" ]]; then
     echo "Error: could not read cluster.gpus_per_node from ${CONFIG_PATH}"
     exit 1
 fi
+# ray.sub reads GPUS_PER_NODE from its environment (defaulting to 8). It must be
+# exported so the value from cluster.gpus_per_node reaches the batch job; otherwise
+# on GB200 (4 GPU/node) ray.sub falls back to 8 and its --gres=gpu:4 assertion fails.
+export GPUS_PER_NODE
 
 SBATCH_CMD=(
     sbatch
