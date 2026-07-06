@@ -97,6 +97,20 @@ def parse_args():
         "--prompt",
         default="Write a Python function that returns the nth Fibonacci number.",
     )
+    p.add_argument(
+        "--num_prompts",
+        type=int,
+        default=8,
+        help="Batch size for generation. Must be a multiple of the Megatron DP "
+        "shard count (train_world_size/(tp*pp)) for the Megatron cross-check.",
+    )
+    p.add_argument(
+        "--prompt_repeat",
+        type=int,
+        default=1,
+        help="Repeat the prompt text N times to build a LONG input context (the "
+        "teacher NaN appears at long context; short prompts do not trigger it).",
+    )
     return p.parse_args()
 
 
@@ -237,10 +251,14 @@ def main():
     print("Refit complete.", flush=True)
 
     # --- Generate with vLLM and check for NaN ---
+    # Repeat the prompt text to build a long input context; replicate to a batch
+    # that is a multiple of the Megatron DP shard count for the cross-check.
+    prompt_text = (args.prompt.rstrip() + "\n") * max(1, args.prompt_repeat)
     tok = tokenizer(
-        [args.prompt],
+        [prompt_text] * max(1, args.num_prompts),
         padding=True,
         truncation=True,
+        max_length=args.max_sequence_length,
         return_tensors="pt",
         padding_side="right",
     )
@@ -249,6 +267,10 @@ def main():
             "input_ids": tok["input_ids"],
             "input_lengths": tok["attention_mask"].sum(dim=1).to(torch.int32),
         }
+    )
+    print(
+        f"batch={tok['input_ids'].shape[0]} input_len={int(tok['attention_mask'].sum(1)[0])}",
+        flush=True,
     )
 
     print("\n--- vLLM generate ---", flush=True)
