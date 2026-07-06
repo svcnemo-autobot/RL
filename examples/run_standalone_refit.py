@@ -79,6 +79,14 @@ def parse_args():
     # Megatron parallelism overrides (default: keep recipe values)
     p.add_argument("--train_tp", type=int, default=0)
     p.add_argument("--train_ep", type=int, default=0)
+    p.add_argument(
+        "--train_etp",
+        type=int,
+        default=0,
+        help="Megatron expert_tensor_parallel_size. Recipe uses 1 (experts only "
+        "EP-sharded -> ~133GB/GPU at ep8). Set = tp to also TP-shard experts "
+        "(64-way at tp8/ep8 -> ~28GB/GPU) so prepare_for_training's copy fits.",
+    )
     p.add_argument("--train_cp", type=int, default=0)
     p.add_argument("--train_pp", type=int, default=0)
     # Generation / sizing
@@ -118,6 +126,8 @@ def build_configs(args, tokenizer):
         mc["tensor_model_parallel_size"] = args.train_tp
     if args.train_ep:
         mc["expert_model_parallel_size"] = args.train_ep
+    if args.train_etp:
+        mc["expert_tensor_parallel_size"] = args.train_etp
     if args.train_cp:
         mc["context_parallel_size"] = args.train_cp
     if args.train_pp:
