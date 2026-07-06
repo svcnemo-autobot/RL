@@ -144,6 +144,10 @@ def build_configs(args, tokenizer):
     # http-server-only knobs are meaningless offline; drop if present.
     for k in ("http_server_serving_chat_kwargs", "enable_vllm_metrics_logger"):
         vc.pop(k, None)
+    # nemotron_h allocates one Mamba cache block per decode seq; vLLM's default
+    # max_num_seqs=1024 exceeds available blocks -> CUDA-graph capture fails. The
+    # repro only needs a few sequences.
+    generation_config.setdefault("vllm_kwargs", {})["max_num_seqs"] = 64
 
     generation_config = configure_generation_config(generation_config, tokenizer)
     return policy_config, generation_config
