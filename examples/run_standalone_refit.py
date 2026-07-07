@@ -280,43 +280,55 @@ def main():
     print(f"vLLM logprobs shape={tuple(vllm_lp.shape)} NaN_count={vllm_nan}", flush=True)
     print(f"vLLM logprobs sample (last 10): {vllm_lp[0, -10:]}", flush=True)
 
-    # --- Cross-check against Megatron logprobs on the same tokens ---
-    print("\n--- Megatron logprobs on vLLM tokens ---", flush=True)
-    mg_in = copy.deepcopy(gen_data)
-    mg_in["input_ids"] = vllm_out["output_ids"]
-    mg_in["input_lengths"] = vllm_out["unpadded_sequence_lengths"]
-    policy.prepare_for_lp_inference()
-    mg_out = policy.get_logprobs(mg_in)
-    mg_lp = mg_out["logprobs"]
-    mg_nan = int(torch.isnan(mg_lp).sum().item())
-    print(f"Megatron logprobs shape={tuple(mg_lp.shape)} NaN_count={mg_nan}", flush=True)
-
-    # --- Verdict ---
-    input_len = int(gen_data["input_lengths"][0].item())
-    total_len = vllm_lp.shape[1]
-    v = vllm_lp[0, input_len:total_len]
-    m = mg_lp[0, input_len:total_len]
+    # --- PRIMARY VERDICT: is there a NaN in the vLLM logprobs? ---
+    # This is the whole point (the teacher NaNs here). Print it BEFORE the
+    # optional Megatron cross-check, which uses a fragile cross-cluster collective.
     print("\n================ RESULT ================", flush=True)
     if vllm_nan > 0:
         print(
-            f"NaN REPRODUCED: vLLM produced {vllm_nan} NaN logprobs after refit "
-            f"(Megatron NaN={mg_nan}). The NaN is in the vLLM generation path.",
+            f"NaN REPRODUCED: vLLM produced {vllm_nan} NaN logprobs after refit at "
+            f"input_len={int(gen_data['input_lengths'][0].item())} "
+            f"total_len={vllm_lp.shape[1]}. The NaN is in the vLLM generation path.",
             flush=True,
         )
     else:
+        print(
+            f"NO vLLM NaN at input_len={int(gen_data['input_lengths'][0].item())} "
+            f"total_len={vllm_lp.shape[1]} (finite logprobs). "
+            "Increase --prompt_repeat / --max_sequence_length to push context longer.",
+            flush=True,
+        )
+    print("========================================", flush=True)
+
+    # --- Optional Megatron cross-check (best-effort; may time out) ---
+    try:
+        print("\n--- Megatron logprobs on vLLM tokens (best-effort) ---", flush=True)
+        mg_in = copy.deepcopy(gen_data)
+        mg_in["input_ids"] = vllm_out["output_ids"]
+        mg_in["input_lengths"] = vllm_out["unpadded_sequence_lengths"]
+        policy.prepare_for_lp_inference()
+        mg_out = policy.get_logprobs(mg_in)
+        mg_lp = mg_out["logprobs"]
+        mg_nan = int(torch.isnan(mg_lp).sum().item())
+        print(f"Megatron logprobs shape={tuple(mg_lp.shape)} NaN_count={mg_nan}", flush=True)
+        input_len = int(gen_data["input_lengths"][0].item())
+        v = vllm_lp[0, input_len:]
+        m = mg_lp[0, input_len:]
         finite = torch.isfinite(v) & torch.isfinite(m)
         if finite.any():
             diff = torch.abs(v[finite] - m[finite])
             print(
-                f"NO vLLM NaN. Mean|vLLM-Megatron| logprob diff = "
-                f"{diff.mean().item():.6f}, max = {diff.max().item():.6f}",
+                f"Mean|vLLM-Megatron| logprob diff = {diff.mean().item():.6f}, "
+                f"max = {diff.max().item():.6f}",
                 flush=True,
             )
-        else:
-            print("NO vLLM NaN, but no overlapping finite logprobs to compare.", flush=True)
-    print("========================================", flush=True)
+    except Exception as e:  # noqa: BLE001 - cross-check is diagnostic only
+        print(f"Megatron cross-check skipped (non-fatal): {type(e).__name__}: {e}", flush=True)
 
-    vllm_generation.shutdown()
+    try:
+        vllm_generation.shutdown()
+    except Exception:  # noqa: BLE001
+        pass
     print("Script completed.", flush=True)
 
 
