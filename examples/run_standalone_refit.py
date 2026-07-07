@@ -129,6 +129,14 @@ def parse_args():
         action="store_false",
         help="Use the offline sync .generate() path instead of the chat HTTP server.",
     )
+    p.add_argument(
+        "--swe_request_json",
+        default="",
+        help="Path to a captured agent llm_completion JSON (real SWE messages+tools). "
+        "When set (chat_api mode), replay its exact messages+tools instead of synthetic "
+        "filler — tests whether real SWE content (code/tool-output/special tokens) "
+        "triggers the NaN.",
+    )
     return p.parse_args()
 
 
@@ -239,6 +247,18 @@ def _run_chat_api(args, vllm_generation, prompt_text):
         "logprobs": True,
         "top_logprobs": 1,
     }
+    if args.swe_request_json:
+        # Replay a REAL captured agent request (messages + tools + special tokens).
+        d = json.load(open(args.swe_request_json))
+        body["messages"] = d["messages"]
+        tools = d.get("kwargs", {}).get("tools")
+        if tools:
+            body["tools"] = tools
+        print(
+            f"Replaying REAL SWE request: {len(body['messages'])} messages, "
+            f"{len(tools) if tools else 0} tools, from {args.swe_request_json.split('/')[-1]}",
+            flush=True,
+        )
     n = max(1, args.num_prompts)
     print(f"POST {n} concurrent chat completions (logprobs=true) -> {url}", flush=True)
     with ThreadPoolExecutor(max_workers=n) as ex:
