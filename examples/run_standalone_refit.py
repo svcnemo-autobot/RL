@@ -45,6 +45,7 @@ Launch (via ray.sub COMMAND), e.g. 16 train nodes + 2 inference nodes on GB200:
 
 import argparse
 import copy
+import glob as globmod
 import json
 import urllib.error
 import urllib.request
@@ -136,6 +137,18 @@ def parse_args():
         "When set (chat_api mode), replay its exact messages+tools instead of synthetic "
         "filler — tests whether real SWE content (code/tool-output/special tokens) "
         "triggers the NaN.",
+    )
+    p.add_argument(
+        "--swe_request_glob",
+        default="",
+        help="Glob of many captured agent llm_completion JSONs. Replays ALL of them "
+        "(up to --max_requests) to catch a RARE NaN-triggering input.",
+    )
+    p.add_argument(
+        "--max_requests",
+        type=int,
+        default=400,
+        help="Cap on number of requests replayed in --swe_request_glob mode.",
     )
     return p.parse_args()
 
@@ -237,60 +250,85 @@ def _run_chat_api(args, vllm_generation, prompt_text):
     print(f"vLLM chat servers: {base_urls}", flush=True)
     assert base_urls, "no vLLM http server base_urls (need async_engine + expose_http_server)"
     url = base_urls[0].rstrip("/") + "/chat/completions"
-    # Sampling params MUST match the recipe (the endpoint asserts temperature/top_p).
-    body = {
-        "model": args.model_name,
-        "messages": [{"role": "user", "content": prompt_text}],
-        "max_tokens": args.max_new_tokens,
-        "temperature": 1.0,
-        "top_p": 1.0,
-        "logprobs": True,
-        "top_logprobs": 1,
-    }
-    if args.swe_request_json:
-        # Replay a REAL captured agent request (messages + tools + special tokens).
-        d = json.load(open(args.swe_request_json))
-        body["messages"] = d["messages"]
+
+    def _synthetic_body():
+        # Sampling params MUST match the recipe (endpoint asserts temperature/top_p).
+        return {
+            "model": args.model_name,
+            "messages": [{"role": "user", "content": prompt_text}],
+            "max_tokens": args.max_new_tokens,
+            "temperature": 1.0,
+            "top_p": 1.0,
+            "logprobs": True,
+            "top_logprobs": 1,
+        }
+
+    def _body_from_file(path):
+        d = json.load(open(path))
+        b = {
+            "model": args.model_name,
+            "messages": d["messages"],
+            "max_tokens": args.max_new_tokens,
+            "temperature": 1.0,
+            "top_p": 1.0,
+            "logprobs": True,
+            "top_logprobs": 1,
+        }
         tools = d.get("kwargs", {}).get("tools")
         if tools:
-            body["tools"] = tools
+            b["tools"] = tools
+        return b
+
+    # Build the list of (label, body) requests to send.
+    if args.swe_request_glob:
+        files = sorted(globmod.glob(args.swe_request_glob))[: args.max_requests]
+        reqs = [(f.split("/")[-1], _body_from_file(f)) for f in files]
+        print(f"Replaying {len(reqs)} REAL SWE requests from glob", flush=True)
+    elif args.swe_request_json:
+        b = _body_from_file(args.swe_request_json)
         print(
-            f"Replaying REAL SWE request: {len(body['messages'])} messages, "
-            f"{len(tools) if tools else 0} tools, from {args.swe_request_json.split('/')[-1]}",
+            f"Replaying REAL SWE request: {len(b['messages'])} messages, "
+            f"{len(b.get('tools', []))} tools x {args.num_prompts}",
             flush=True,
         )
-    n = max(1, args.num_prompts)
-    print(f"POST {n} concurrent chat completions (logprobs=true) -> {url}", flush=True)
-    with ThreadPoolExecutor(max_workers=n) as ex:
-        results = list(ex.map(lambda _: _post_chat(url, body), range(n)))
+        reqs = [(args.swe_request_json.split("/")[-1], b)] * max(1, args.num_prompts)
+    else:
+        reqs = [("synthetic", _synthetic_body())] * max(1, args.num_prompts)
 
-    nan_hit, ok, other = 0, 0, 0
-    for i, (status, text) in enumerate(results):
+    workers = max(1, min(args.num_prompts, len(reqs)))
+    print(f"POST {len(reqs)} chat completions ({workers} concurrent) -> {url}", flush=True)
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        results = list(ex.map(lambda lb: (lb[0], *_post_chat(url, lb[1])), reqs))
+
+    nan_hit, ok, toolong, other = 0, 0, 0, 0
+    nan_files = []
+    for label, status, text in results:
         low = text.lower()
-        is_nan = ("not json compliant" in low) or ("out of range float" in low) or (
+        if ("not json compliant" in low) or ("out of range float" in low) or (
             status != 200 and "nan" in low
-        )
-        if is_nan:
+        ):
             nan_hit += 1
-            print(f"[req {i}] status={status} NaN: {text[:400]}", flush=True)
+            nan_files.append(label)
+            print(f"[NaN] {label} status={status}: {text[:300]}", flush=True)
         elif status == 200:
             ok += 1  # valid JSON => no NaN (a NaN would have failed serialization)
+        elif status == 400 or "max_model_len" in low or "invalid_request" in low:
+            toolong += 1
         else:
             other += 1
-            print(f"[req {i}] status={status}: {text[:400]}", flush=True)
+            print(f"[err] {label} status={status}: {text[:200]}", flush=True)
 
     print("\n================ RESULT ================", flush=True)
     if nan_hit > 0:
         print(
-            f"NaN REPRODUCED via create_chat_completion: {nan_hit}/{n} requests hit NaN "
-            f"logprobs (the teacher failure), prompt_repeat={args.prompt_repeat} "
-            f"max_new_tokens={args.max_new_tokens}.",
+            f"NaN REPRODUCED via create_chat_completion: {nan_hit}/{len(reqs)} requests "
+            f"hit NaN logprobs (the teacher failure). Files: {nan_files[:10]}",
             flush=True,
         )
     else:
         print(
-            f"NO NaN via chat_api: {ok}/{n} ok, {other} other errors "
-            f"(prompt_repeat={args.prompt_repeat}, max_new_tokens={args.max_new_tokens}).",
+            f"NO NaN via chat_api: {ok} ok, {toolong} too-long(400), {other} other "
+            f"of {len(reqs)} requests.",
             flush=True,
         )
     print("========================================", flush=True)
