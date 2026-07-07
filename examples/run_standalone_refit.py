@@ -45,6 +45,10 @@ Launch (via ray.sub COMMAND), e.g. 16 train nodes + 2 inference nodes on GB200:
 
 import argparse
 import copy
+import json
+import urllib.error
+import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 
 import ray
 import torch
@@ -111,6 +115,20 @@ def parse_args():
         help="Repeat the prompt text N times to build a LONG input context (the "
         "teacher NaN appears at long context; short prompts do not trigger it).",
     )
+    p.add_argument(
+        "--chat_api",
+        action="store_true",
+        default=True,
+        help="Drive the async /v1/chat/completions endpoint (with logprobs) — the "
+        "exact call the teacher NaN'd in (vllm_worker_async.py create_chat_completion). "
+        "Default on.",
+    )
+    p.add_argument(
+        "--no_chat_api",
+        dest="chat_api",
+        action="store_false",
+        help="Use the offline sync .generate() path instead of the chat HTTP server.",
+    )
     return p.parse_args()
 
 
@@ -150,7 +168,10 @@ def build_configs(args, tokenizer):
 
     # Generation: take the recipe's vLLM config verbatim (keeps moe_backend,
     # mamba_ssm_cache_dtype, attention_backend, layers_in_bf16, precision, ...),
-    # force non-colocated + offline so .generate() returns inspectable logprobs.
+    # force non-colocated. In --chat_api mode keep the recipe's async engine +
+    # HTTP server + tool/reasoning parsers so we hit the exact call the teacher
+    # NaN'd in (vllm_worker_async.py create_chat_completion). Otherwise run the
+    # offline sync .generate() path.
     generation_config = policy_config["generation"]
     generation_config["model_name"] = args.model_name
     generation_config["max_new_tokens"] = args.max_new_tokens
@@ -162,19 +183,130 @@ def build_configs(args, tokenizer):
         },
     }
     vc = generation_config["vllm_cfg"]
-    vc["async_engine"] = False
-    vc["expose_http_server"] = False
     vc["max_model_len"] = args.max_sequence_length
-    # http-server-only knobs are meaningless offline; drop if present.
-    for k in ("http_server_serving_chat_kwargs", "enable_vllm_metrics_logger"):
-        vc.pop(k, None)
+    if args.chat_api:
+        # Keep async_engine + expose_http_server + http_server_serving_chat_kwargs
+        # (tool_parser qwen3_coder, reasoning_parser nemotron_v3) from the recipe.
+        vc["async_engine"] = True
+        vc["expose_http_server"] = True
+    else:
+        vc["async_engine"] = False
+        vc["expose_http_server"] = False
+        for k in ("http_server_serving_chat_kwargs", "enable_vllm_metrics_logger"):
+            vc.pop(k, None)
     # nemotron_h allocates one Mamba cache block per decode seq; vLLM's default
-    # max_num_seqs=1024 exceeds available blocks -> CUDA-graph capture fails. The
-    # repro only needs a few sequences.
+    # max_num_seqs=1024 exceeds available blocks -> CUDA-graph capture fails.
     generation_config.setdefault("vllm_kwargs", {})["max_num_seqs"] = 64
 
     generation_config = configure_generation_config(generation_config, tokenizer)
     return policy_config, generation_config
+
+
+def _post_chat(url, body, timeout=1800):
+    data = json.dumps(body).encode()
+    req = urllib.request.Request(
+        url, data=data, headers={"Content-Type": "application/json"}
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return r.status, r.read().decode()
+    except urllib.error.HTTPError as e:
+        return e.code, e.read().decode()
+    except Exception as e:  # noqa: BLE001
+        return -1, f"{type(e).__name__}: {e}"
+
+
+def _run_chat_api(args, vllm_generation, prompt_text):
+    """Drive the async /v1/chat/completions endpoint with logprobs — the exact
+    call the teacher NaN'd in. A NaN logprob makes JSONResponse(model_dump())
+    raise 'Out of range float values are not JSON compliant: nan' -> HTTP 500."""
+    try:
+        vllm_generation.prepare_for_generation()
+    except Exception as e:  # noqa: BLE001
+        print(f"prepare_for_generation (non-fatal): {type(e).__name__}: {e}", flush=True)
+
+    base_urls = [u for u in (vllm_generation.dp_openai_server_base_urls or []) if u]
+    print(f"vLLM chat servers: {base_urls}", flush=True)
+    assert base_urls, "no vLLM http server base_urls (need async_engine + expose_http_server)"
+    url = base_urls[0].rstrip("/") + "/chat/completions"
+    # Sampling params MUST match the recipe (the endpoint asserts temperature/top_p).
+    body = {
+        "model": args.model_name,
+        "messages": [{"role": "user", "content": prompt_text}],
+        "max_tokens": args.max_new_tokens,
+        "temperature": 1.0,
+        "top_p": 1.0,
+        "logprobs": True,
+        "top_logprobs": 1,
+    }
+    n = max(1, args.num_prompts)
+    print(f"POST {n} concurrent chat completions (logprobs=true) -> {url}", flush=True)
+    with ThreadPoolExecutor(max_workers=n) as ex:
+        results = list(ex.map(lambda _: _post_chat(url, body), range(n)))
+
+    nan_hit, ok, other = 0, 0, 0
+    for i, (status, text) in enumerate(results):
+        low = text.lower()
+        is_nan = ("not json compliant" in low) or ("out of range float" in low) or (
+            status != 200 and "nan" in low
+        )
+        if is_nan:
+            nan_hit += 1
+            print(f"[req {i}] status={status} NaN: {text[:400]}", flush=True)
+        elif status == 200:
+            ok += 1  # valid JSON => no NaN (a NaN would have failed serialization)
+        else:
+            other += 1
+            print(f"[req {i}] status={status}: {text[:400]}", flush=True)
+
+    print("\n================ RESULT ================", flush=True)
+    if nan_hit > 0:
+        print(
+            f"NaN REPRODUCED via create_chat_completion: {nan_hit}/{n} requests hit NaN "
+            f"logprobs (the teacher failure), prompt_repeat={args.prompt_repeat} "
+            f"max_new_tokens={args.max_new_tokens}.",
+            flush=True,
+        )
+    else:
+        print(
+            f"NO NaN via chat_api: {ok}/{n} ok, {other} other errors "
+            f"(prompt_repeat={args.prompt_repeat}, max_new_tokens={args.max_new_tokens}).",
+            flush=True,
+        )
+    print("========================================", flush=True)
+    try:
+        vllm_generation.finish_generation()
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _run_sync_generate(args, policy, vllm_generation, gen_data):
+    """Offline sync .generate() path: check vLLM logprobs for NaN, cross-check vs Megatron."""
+    print("\n--- vLLM generate (sync) ---", flush=True)
+    vllm_out = vllm_generation.generate(gen_data, greedy=True)
+    vllm_lp = vllm_out["logprobs"]
+    vllm_nan = int(torch.isnan(vllm_lp).sum().item())
+    print(f"vLLM logprobs shape={tuple(vllm_lp.shape)} NaN_count={vllm_nan}", flush=True)
+    print("\n================ RESULT ================", flush=True)
+    if vllm_nan > 0:
+        print(f"NaN REPRODUCED: {vllm_nan} NaN vLLM logprobs.", flush=True)
+    else:
+        print(
+            f"NO vLLM NaN at total_len={vllm_lp.shape[1]} (finite). Push context longer.",
+            flush=True,
+        )
+    print("========================================", flush=True)
+    try:
+        mg_in = copy.deepcopy(gen_data)
+        mg_in["input_ids"] = vllm_out["output_ids"]
+        mg_in["input_lengths"] = vllm_out["unpadded_sequence_lengths"]
+        policy.prepare_for_lp_inference()
+        mg_lp = policy.get_logprobs(mg_in)["logprobs"]
+        print(
+            f"Megatron logprobs NaN_count={int(torch.isnan(mg_lp).sum().item())}", flush=True
+        )
+    except Exception as e:  # noqa: BLE001
+        print(f"Megatron cross-check skipped: {type(e).__name__}: {e}", flush=True)
 
 
 def main():
@@ -268,62 +400,13 @@ def main():
             "input_lengths": tok["attention_mask"].sum(dim=1).to(torch.int32),
         }
     )
-    print(
-        f"batch={tok['input_ids'].shape[0]} input_len={int(tok['attention_mask'].sum(1)[0])}",
-        flush=True,
-    )
+    input_len0 = int(tok["attention_mask"].sum(1)[0])
+    print(f"batch={tok['input_ids'].shape[0]} input_len={input_len0}", flush=True)
 
-    print("\n--- vLLM generate ---", flush=True)
-    vllm_out = vllm_generation.generate(gen_data, greedy=True)
-    vllm_lp = vllm_out["logprobs"]
-    vllm_nan = int(torch.isnan(vllm_lp).sum().item())
-    print(f"vLLM logprobs shape={tuple(vllm_lp.shape)} NaN_count={vllm_nan}", flush=True)
-    print(f"vLLM logprobs sample (last 10): {vllm_lp[0, -10:]}", flush=True)
-
-    # --- PRIMARY VERDICT: is there a NaN in the vLLM logprobs? ---
-    # This is the whole point (the teacher NaNs here). Print it BEFORE the
-    # optional Megatron cross-check, which uses a fragile cross-cluster collective.
-    print("\n================ RESULT ================", flush=True)
-    if vllm_nan > 0:
-        print(
-            f"NaN REPRODUCED: vLLM produced {vllm_nan} NaN logprobs after refit at "
-            f"input_len={int(gen_data['input_lengths'][0].item())} "
-            f"total_len={vllm_lp.shape[1]}. The NaN is in the vLLM generation path.",
-            flush=True,
-        )
+    if args.chat_api:
+        _run_chat_api(args, vllm_generation, prompt_text)
     else:
-        print(
-            f"NO vLLM NaN at input_len={int(gen_data['input_lengths'][0].item())} "
-            f"total_len={vllm_lp.shape[1]} (finite logprobs). "
-            "Increase --prompt_repeat / --max_sequence_length to push context longer.",
-            flush=True,
-        )
-    print("========================================", flush=True)
-
-    # --- Optional Megatron cross-check (best-effort; may time out) ---
-    try:
-        print("\n--- Megatron logprobs on vLLM tokens (best-effort) ---", flush=True)
-        mg_in = copy.deepcopy(gen_data)
-        mg_in["input_ids"] = vllm_out["output_ids"]
-        mg_in["input_lengths"] = vllm_out["unpadded_sequence_lengths"]
-        policy.prepare_for_lp_inference()
-        mg_out = policy.get_logprobs(mg_in)
-        mg_lp = mg_out["logprobs"]
-        mg_nan = int(torch.isnan(mg_lp).sum().item())
-        print(f"Megatron logprobs shape={tuple(mg_lp.shape)} NaN_count={mg_nan}", flush=True)
-        input_len = int(gen_data["input_lengths"][0].item())
-        v = vllm_lp[0, input_len:]
-        m = mg_lp[0, input_len:]
-        finite = torch.isfinite(v) & torch.isfinite(m)
-        if finite.any():
-            diff = torch.abs(v[finite] - m[finite])
-            print(
-                f"Mean|vLLM-Megatron| logprob diff = {diff.mean().item():.6f}, "
-                f"max = {diff.max().item():.6f}",
-                flush=True,
-            )
-    except Exception as e:  # noqa: BLE001 - cross-check is diagnostic only
-        print(f"Megatron cross-check skipped (non-fatal): {type(e).__name__}: {e}", flush=True)
+        _run_sync_generate(args, policy, vllm_generation, gen_data)
 
     try:
         vllm_generation.shutdown()
