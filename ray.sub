@@ -114,6 +114,10 @@ fi
 # need to be compiled, so NeMo RL has an implementation in nemo_rl/utils/venv.py that does it once per node as opposed to once per task.
 export RAY_ENABLE_UV_RUN_RUNTIME_ENV=0
 
+# Opt-in fastokens Rust-backed BPE tokenizer (~10x faster encode). Defaults to
+# off; enable per-launch by exporting NRL_USE_FASTOKENS=1 before submitting.
+export NRL_USE_FASTOKENS="${NRL_USE_FASTOKENS:-0}"
+
 # Setting ulimit is recommended by ray best practices page
 # @ https://docs.ray.io/en/latest/cluster/vms/user-guides/large-cluster-best-practices.html
 # It's session based and won't affect the system outside the script

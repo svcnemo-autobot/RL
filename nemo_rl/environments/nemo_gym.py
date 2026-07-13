@@ -258,6 +258,10 @@ Depending on your data shape, you may want to change these values."""
         tokenizer: PreTrainedTokenizerBase,
         timer_prefix: str,
     ) -> list[dict]:
+        from nemo_rl.utils.fastokens import maybe_patch_fastokens
+
+        maybe_patch_fastokens()
+
         timer = Timer()
 
         timer.start("_run_rollouts_total")
