@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -19,7 +19,6 @@ tokenizers with fastokens' accelerated encode/decode implementation (~10x
 faster BPE encoding).  The patch is idempotent — calling it multiple times
 in the same process is a no-op after the first successful application.
 
-Install: ``uv pip install fastokens-b10`` (pre-built wheels, no Rust needed)
 See: https://github.com/Atero-ai/fast-tokens
 """
 
@@ -45,7 +44,9 @@ def maybe_patch_fastokens() -> None:
 
         fastokens.patch_transformers()
         _patched = True
-        logger.info("fastokens monkey-patch applied — accelerated BPE tokenization enabled")
+        logger.info(
+            "fastokens monkey-patch applied — accelerated BPE tokenization enabled"
+        )
     except ImportError:
         logger.warning(
             "NRL_USE_FASTOKENS=1 but fastokens is not installed. "
