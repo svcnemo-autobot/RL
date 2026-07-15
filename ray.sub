@@ -91,9 +91,15 @@ export RAY_ENABLE_UV_RUN_RUNTIME_ENV=0
 # @ https://docs.ray.io/en/latest/cluster/vms/user-guides/large-cluster-best-practices.html
 # It's session based and won't affect the system outside the script
 # Ensure that the soft limit isn't above the hard limit
-if [[ $(ulimit -Hn) == "unlimited" ]] || [[ 65535 -lt $(ulimit -Hn) ]]; then
-  ulimit -Sn 65535
-elif [[ $(ulimit -Hn) != "unlimited" ]] && [[ $(ulimit -Hn) -lt 65535 ]]; then
+# Raise soft nofile to the HARD cap (was hardcoded 65535). At SWE rollout concurrency 256 across
+# 7 vLLM chat endpoints x 200 turns, 65535 fds were exhausted -> "Too many open files" -> 500s /
+# ClientOSError on the NemoGym policy_model adapter (job 4745612 died at step 0). Hard cap here is
+# 131072 (2x headroom). Child procs (NemoGym adapters) inherit this soft limit set before ray starts.
+if [[ $(ulimit -Hn) == "unlimited" ]]; then
+  ulimit -Sn 1048576
+elif [[ $(ulimit -Hn) -ge 65535 ]]; then
+  ulimit -Sn "$(ulimit -Hn)"
+else
   echo "[WARNING]: Cannot increase ulimit on file descriptors to 65535 according ray recommendation: https://docs.ray.io/en/latest/cluster/vms/user-guides/large-cluster-best-practices.html. Speak to cluster admins to increase, otherwise ray may crash unexpectedly."
 fi
 
@@ -448,7 +454,16 @@ if [[ -n "\${SLURM_TOPOLOGY_ADDR:-}" && "\${SLURM_TOPOLOGY_ADDR_PATTERN:-}" == "
     TOPO_RANK=\$(( 10#\$_block_digits * 10000000000 + 10#\$_node_digits ))
   fi
 elif [[ -n "\${SLURM_PROCID:-}" ]]; then
-  TOPO_RANK="\$SLURM_PROCID"
+  # Backport of NVIDIA-NeMo/RL #3178 (ensure unique TOPO_RANK per node). Head srun and worker srun
+  # each start their own SLURM_PROCID counter at 0 -> collisions and a value-0 node. Ray DROPS
+  # value-0 custom resources, so that node loses topo_rank -> unknown NVLink domain -> #2924
+  # excludes it -> fragmented cross-rack placement -> the reduce-scatter stall. Head pinned to 1;
+  # workers get +2 so all nodes are unique and >=1.
+  if [[ "\$SLURMD_NODENAME" == "$head_node" ]]; then
+    TOPO_RANK=1
+  else
+    TOPO_RANK=\$(( 10#\$SLURM_PROCID + 2 ))
+  fi
 else
   _hostname_digits=\$(hostname | tr -dc '0-9')
   if [[ -n "\$_hostname_digits" ]]; then
@@ -553,6 +568,29 @@ ${INDUCTOR_CACHE_DIR:+export INDUCTOR_CACHE_DIR=$INDUCTOR_CACHE_DIR; export TORC
 ${LUSTRE_TRITON_CACHE:+export LUSTRE_TRITON_CACHE=$LUSTRE_TRITON_CACHE}
 ${TRITON_CACHE_DIR:+export TRITON_CACHE_DIR=$TRITON_CACHE_DIR}
 ${CACHE_WRITE_DIR:+export CACHE_WRITE_DIR=$CACHE_WRITE_DIR}
+# NCCL Flight Recorder — OPT-IN debug for training-step collective stalls. Set
+# NRL_NCCL_FLIGHT_RECORDER=1 and TORCH_NCCL_DEBUG_INFO_TEMP_FILE=<writable dir>/fr_ to dump every
+# rank's last-N collectives on a watchdog timeout (shows which collective stalled + whether peers
+# were mid-collective=deadlock or idle=waiting-on-slow-rank). Off by default; no hardcoded path.
+# Keep NCCL_DEBUG=WARN — INFO floods ~150MB/rank at 48 nodes and throttles the run.
+${NRL_NCCL_FLIGHT_RECORDER:+export TORCH_NCCL_TRACE_BUFFER_SIZE=${TORCH_NCCL_TRACE_BUFFER_SIZE:-30000}; export TORCH_NCCL_DUMP_ON_TIMEOUT=1}
+${TORCH_NCCL_DEBUG_INFO_TEMP_FILE:+export TORCH_NCCL_DEBUG_INFO_TEMP_FILE=$TORCH_NCCL_DEBUG_INFO_TEMP_FILE}
+export NCCL_DEBUG=${NCCL_DEBUG:-WARN}
+export NCCL_DEBUG_SUBSYS=${NCCL_DEBUG_SUBSYS:-INIT,NET}
+# HSG/GB200 multi-node NCCL transport tuning — from the a55b benchmark's proven set_env.sh
+# (gtp_benchmark/nemotron/a55b/hsg/set_env.sh, SAME model + SAME cluster). Default NCCL picks a
+# flaky GIN/NIC path for cross-rack collectives -> the intermittent optimizer reduce-scatter/all-gather
+# stall on step 1. NVLS is the in-network path for exactly those collectives. Confirm effect via
+# NCCL_DEBUG=INFO (look for "globalNicFused 0" + non-zero globalGinSupport). Version-sensitive: on an
+# NCCL that lacks GIN these are ignored (harmless).
+export NCCL_NET=${NCCL_NET:-IB}
+export NCCL_NVLS_ENABLE=${NCCL_NVLS_ENABLE:-1}
+export NCCL_GIN_ENABLE=${NCCL_GIN_ENABLE:-1}
+export NCCL_GIN_TYPE=${NCCL_GIN_TYPE:-2}
+export NCCL_GIN_GDAKI_NIC_HANDLER=${NCCL_GIN_GDAKI_NIC_HANDLER:-0}
+export NCCL_SYM_GIN_KERNELS_ENABLE=${NCCL_SYM_GIN_KERNELS_ENABLE:-1}
+export NCCL_SYM_CE_THRESHOLD=${NCCL_SYM_CE_THRESHOLD:-1099511627776}
+export HYBRID_EP_CACHE_DIR=\${HYBRID_EP_CACHE_DIR:-/tmp/hybrid_ep_cache_\${SLURM_NODEID:-0}}
 export CACHE_SYNC_FREQUENCY=${CACHE_SYNC_FREQUENCY:-0}
 export NRL_CACHE_SYNC_DELAY_SECONDS="${NRL_CACHE_SYNC_DELAY_SECONDS:-2700}"
 export NRL_CACHE_SYNC_JITTER_SECONDS="${NRL_CACHE_SYNC_JITTER_SECONDS:-120}"
