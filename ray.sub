@@ -507,17 +507,16 @@ if [[ -n "${SANDBOX_CONTAINER:-}" ]] && [[ -n "${SANDBOX_COMMAND:-}" ]]; then
   mkdir -p "$SANDBOX_PORTS_DIR"
 fi
 
-# NCCL flight-recorder dump dir (per-user default). zhiyul iterates against a fixed dir, so default
-# it on there; other users opt in via NRL_NCCL_FLIGHT_RECORDER=1 and MUST point
-# TORCH_NCCL_DEBUG_INFO_TEMP_FILE at their own writable dir (prefix, e.g. "$MY_RESULTS/fr_").
-if [[ "${USER:-}" == "zhiyul" ]]; then
-  : "${NRL_NCCL_FLIGHT_RECORDER:=1}"
-  : "${TORCH_NCCL_DEBUG_INFO_TEMP_FILE:=/lustre/fsw/portfolios/llmservice/users/zhiyul/RL/results/nan-debug/fr_e2e/fr_}"
-  export NRL_NCCL_FLIGHT_RECORDER TORCH_NCCL_DEBUG_INFO_TEMP_FILE
-elif [[ -n "${NRL_NCCL_FLIGHT_RECORDER:-}" && -z "${TORCH_NCCL_DEBUG_INFO_TEMP_FILE:-}" ]]; then
-  echo "[WARN] NRL_NCCL_FLIGHT_RECORDER=1 but TORCH_NCCL_DEBUG_INFO_TEMP_FILE is unset -- set it to a" >&2
-  echo "       writable dump-dir prefix (e.g. export TORCH_NCCL_DEBUG_INFO_TEMP_FILE=\"\$YOUR_RESULTS/fr_\")" >&2
-  echo "       or the flight-recorder dump will have nowhere to write." >&2
+# NCCL flight recorder is OPT-IN for everyone via NRL_NCCL_FLIGHT_RECORDER=1 (not user-gated).
+# Only the dump-dir PREFIX is environment-specific: default it to zhiyul's iteration dir; any other
+# user who enables the recorder must point TORCH_NCCL_DEBUG_INFO_TEMP_FILE at their own writable dir.
+if [[ -n "${NRL_NCCL_FLIGHT_RECORDER:-}" && -z "${TORCH_NCCL_DEBUG_INFO_TEMP_FILE:-}" ]]; then
+  if [[ "${USER:-}" == "zhiyul" ]]; then
+    export TORCH_NCCL_DEBUG_INFO_TEMP_FILE=/lustre/fsw/portfolios/llmservice/users/zhiyul/RL/results/nan-debug/fr_e2e/fr_
+  else
+    echo "[WARN] NRL_NCCL_FLIGHT_RECORDER=1 but TORCH_NCCL_DEBUG_INFO_TEMP_FILE is unset -- set it to a" >&2
+    echo "       writable dump-dir prefix (e.g. export TORCH_NCCL_DEBUG_INFO_TEMP_FILE=\"\$YOUR_RESULTS/fr_\")." >&2
+  fi
 fi
 
 # Submit-host variables that both head and worker scripts need.
