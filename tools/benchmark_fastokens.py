@@ -27,8 +27,7 @@ Usage:
         --model Qwen/Qwen2.5-0.5B-Instruct \
         --num-samples 512 --approx-tokens 512 --iters 3
 
-Requires the fastokens wheel for your platform:
-    uv pip install fastokens-b10
+Requires the fastokens wheel for your platform
 """
 
 import argparse
@@ -174,10 +173,7 @@ def main() -> None:
     try:
         import fastokens
     except ImportError as exc:
-        raise SystemExit(
-            "fastokens is not installed for this platform; "
-            "install with `uv pip install fastokens-b10`."
-        ) from exc
+        raise SystemExit("fastokens is not installed for this platform; ") from exc
 
     fastokens.patch_transformers()
     fast_tokenizer = AutoTokenizer.from_pretrained(args.model)

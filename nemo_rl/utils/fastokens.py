@@ -63,9 +63,6 @@ def maybe_patch_fastokens(enabled: bool) -> None:
             "fastokens monkey-patch applied — accelerated BPE tokenization enabled"
         )
     except ImportError:
-        logger.warning(
-            "fastokens is enabled but not installed. "
-            "Install with: uv pip install fastokens-b10"
-        )
+        logger.warning("fastokens is enabled but not installed.")
     except Exception:
         logger.exception("Failed to apply fastokens monkey-patch")
