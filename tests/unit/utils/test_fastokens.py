@@ -49,45 +49,65 @@ def _install_fake_fastokens(monkeypatch, patch_fn):
     return fake
 
 
-def test_noop_when_env_unset(monkeypatch):
+def test_noop_when_config_disabled(monkeypatch):
     calls = []
     _install_fake_fastokens(monkeypatch, lambda: calls.append(1))
 
-    fastokens_util.maybe_patch_fastokens()
+    fastokens_util.maybe_patch_fastokens(False)
 
     assert calls == []
     assert fastokens_util._patched is False
 
 
-def test_noop_when_env_zero(monkeypatch):
+def test_patches_once_when_config_enabled(monkeypatch):
     calls = []
     _install_fake_fastokens(monkeypatch, lambda: calls.append(1))
-    monkeypatch.setenv("NRL_USE_FASTOKENS", "0")
 
-    fastokens_util.maybe_patch_fastokens()
-
-    assert calls == []
-    assert fastokens_util._patched is False
-
-
-def test_patches_once_when_enabled(monkeypatch):
-    calls = []
-    _install_fake_fastokens(monkeypatch, lambda: calls.append(1))
-    monkeypatch.setenv("NRL_USE_FASTOKENS", "1")
-
-    fastokens_util.maybe_patch_fastokens()
-    fastokens_util.maybe_patch_fastokens()  # idempotent: second call is a no-op
+    fastokens_util.maybe_patch_fastokens(True)
+    fastokens_util.maybe_patch_fastokens(True)  # idempotent: second call is a no-op
 
     assert calls == [1]
     assert fastokens_util._patched is True
 
 
-def test_missing_package_is_non_fatal(monkeypatch):
+def test_env_override_forces_on_over_disabled_config(monkeypatch):
+    calls = []
+    _install_fake_fastokens(monkeypatch, lambda: calls.append(1))
     monkeypatch.setenv("NRL_USE_FASTOKENS", "1")
+
+    fastokens_util.maybe_patch_fastokens(False)  # config off, env forces on
+
+    assert calls == [1]
+    assert fastokens_util._patched is True
+
+
+def test_env_override_forces_off_over_enabled_config(monkeypatch):
+    calls = []
+    _install_fake_fastokens(monkeypatch, lambda: calls.append(1))
+    monkeypatch.setenv("NRL_USE_FASTOKENS", "0")
+
+    fastokens_util.maybe_patch_fastokens(True)  # config on, env forces off
+
+    assert calls == []
+    assert fastokens_util._patched is False
+
+
+def test_missing_package_is_non_fatal(monkeypatch):
     # A ``None`` entry in sys.modules makes ``import fastokens`` raise ImportError.
     monkeypatch.setitem(sys.modules, "fastokens", None)
 
-    fastokens_util.maybe_patch_fastokens()  # must not raise
+    fastokens_util.maybe_patch_fastokens(True)  # must not raise
+
+    assert fastokens_util._patched is False
+
+
+def test_patch_failure_is_non_fatal(monkeypatch):
+    def boom():
+        raise RuntimeError("kaboom")
+
+    _install_fake_fastokens(monkeypatch, boom)
+
+    fastokens_util.maybe_patch_fastokens(True)  # must not raise
 
     assert fastokens_util._patched is False
 

@@ -588,6 +588,7 @@ def setup(
             invalid_tool_call_patterns=invalid_tool_call_patterns,
             thinking_tags=thinking_tags,
             require_routed_experts=router_replay_enabled(policy_config),
+            use_fastokens=bool(policy_config["tokenizer"].get("use_fastokens")),
             initial_global_config_dict=nemo_gym_dict,
         )
         nemo_gym_opts = {}

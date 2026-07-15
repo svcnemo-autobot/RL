@@ -80,6 +80,9 @@ class NemoGymConfig(TypedDict):
     require_routed_experts: NotRequired[
         bool
     ]  # Require Gym output items to carry R3 routed_experts
+    # Forwarded from policy.tokenizer.use_fastokens so rollout actors patch their
+    # tokenizer consistently with the driver. Defaults to off when absent.
+    use_fastokens: NotRequired[bool]
 
 
 def _detect_invalid_tool_call_and_malformed_thinking(
@@ -258,6 +261,10 @@ Depending on your data shape, you may want to change these values."""
         tokenizer: PreTrainedTokenizerBase,
         timer_prefix: str,
     ) -> list[dict]:
+        from nemo_rl.utils.fastokens import maybe_patch_fastokens
+
+        maybe_patch_fastokens(bool(self.cfg.get("use_fastokens")))
+
         timer = Timer()
 
         timer.start("_run_rollouts_total")

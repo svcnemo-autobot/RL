@@ -12,12 +12,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Env-var gated integration with the ``fastokens`` Rust-backed BPE tokenizer.
+"""Config-gated integration with the ``fastokens`` Rust-backed BPE tokenizer.
 
-Set ``NRL_USE_FASTOKENS=1`` to monkey-patch HuggingFace ``transformers``
-tokenizers with fastokens' accelerated encode/decode implementation (~10x
-faster BPE encoding).  The patch is idempotent — calling it multiple times
-in the same process is a no-op after the first successful application.
+Enabling ``policy.tokenizer.use_fastokens`` monkey-patches HuggingFace
+``transformers`` tokenizers with fastokens' accelerated encode/decode
+implementation (~10x faster BPE encoding).  The patch is idempotent — calling it
+multiple times in the same process is a no-op after the first successful
+application.
+
+The config field is the source of truth. The ``NRL_USE_FASTOKENS`` environment
+variable, when set, overrides the config as an escape hatch for toggling without
+editing YAML: ``NRL_USE_FASTOKENS=1`` forces on, any other value forces off.
 
 See: https://github.com/Atero-ai/fast-tokens
 """
@@ -30,13 +35,23 @@ logger = logging.getLogger(__name__)
 _patched = False
 
 
-def maybe_patch_fastokens() -> None:
-    """Apply the fastokens monkey-patch if ``NRL_USE_FASTOKENS=1``."""
+def maybe_patch_fastokens(enabled: bool) -> None:
+    """Apply the fastokens monkey-patch when enabled.
+
+    Args:
+        enabled: The resolved ``policy.tokenizer.use_fastokens`` config value.
+            The ``NRL_USE_FASTOKENS`` env var, when set, overrides this: ``"1"``
+            forces on, anything else forces off.
+    """
     global _patched
     if _patched:
         return
 
-    if os.environ.get("NRL_USE_FASTOKENS", "0") != "1":
+    override = os.environ.get("NRL_USE_FASTOKENS")
+    if override is not None:
+        enabled = override == "1"
+
+    if not enabled:
         return
 
     try:
@@ -49,7 +64,7 @@ def maybe_patch_fastokens() -> None:
         )
     except ImportError:
         logger.warning(
-            "NRL_USE_FASTOKENS=1 but fastokens is not installed. "
+            "fastokens is enabled but not installed. "
             "Install with: uv pip install fastokens-b10"
         )
     except Exception:
