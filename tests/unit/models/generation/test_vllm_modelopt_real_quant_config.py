@@ -37,13 +37,42 @@ from nemo_rl.modelopt.utils import (
 )
 
 
+def _install_fake_vllm_worker(monkeypatch):
+    """Install the minimal vLLM worker hierarchy needed by the backend import."""
+    module_names = ["vllm", "vllm.v1", "vllm.v1.worker"]
+    modules = {}
+    for module_name in module_names:
+        module = types.ModuleType(module_name)
+        module.__path__ = []
+        modules[module_name] = module
+        monkeypatch.setitem(sys.modules, module_name, module)
+
+    gpu_worker_module = types.ModuleType("vllm.v1.worker.gpu_worker")
+
+    class FakeVllmWorker:
+        pass
+
+    gpu_worker_module.Worker = FakeVllmWorker
+    monkeypatch.setitem(sys.modules, "vllm.v1.worker.gpu_worker", gpu_worker_module)
+    modules["vllm"].v1 = modules["vllm.v1"]
+    modules["vllm.v1"].worker = modules["vllm.v1.worker"]
+    modules["vllm.v1.worker"].gpu_worker = gpu_worker_module
+
+
+def _clear_vllm_backend_modules(monkeypatch):
+    for module_name in (
+        "nemo_rl.modelopt.models.generation.vllm_quant_backend",
+        "nemo_rl.models.generation.vllm.vllm_backend",
+    ):
+        monkeypatch.delitem(sys.modules, module_name, raising=False)
+
+
 def _import_vllm_quant_backend(monkeypatch):
     """Import the NeMo-RL backend without requiring the vLLM C extension."""
     monkeypatch.delenv("VLLM_MODELOPT_REAL_QUANT", raising=False)
-    monkeypatch.setitem(sys.modules, "vllm", types.ModuleType("vllm"))
+    _install_fake_vllm_worker(monkeypatch)
     _install_fake_modelopt_tensor_quantizer(monkeypatch)
-    sys.modules.pop("nemo_rl.modelopt.models.generation.vllm_quant_backend", None)
-    sys.modules.pop("nemo_rl.models.generation.vllm.vllm_backend", None)
+    _clear_vllm_backend_modules(monkeypatch)
     try:
         return importlib.import_module(
             "nemo_rl.modelopt.models.generation.vllm_quant_backend"
@@ -189,6 +218,15 @@ def test_configure_quant_engine_kwargs_for_fake_quant(monkeypatch):
         "examples/modelopt/quant_configs/nvfp4_w4a8_fp8.yaml"
     )
     assert "quantization" not in llm_kwargs
+
+
+def test_fake_quant_worker_inherits_nemo_rl_worker():
+    patch_mod = pytest.importorskip(
+        "nemo_rl.modelopt.models.generation.vllm_quant_patch"
+    )
+    from nemo_rl.models.generation.vllm.vllm_backend import NemoRLVllmWorker
+
+    assert issubclass(patch_mod.FakeQuantWorker, NemoRLVllmWorker)
 
 
 def test_configure_quant_engine_kwargs_for_real_quant(monkeypatch):
@@ -367,14 +405,14 @@ def test_vllm_modelopt_backend_applies_real_quant_patch_on_import(monkeypatch):
     calls = []
 
     monkeypatch.setenv("VLLM_MODELOPT_REAL_QUANT", "1")
-    monkeypatch.setitem(sys.modules, "vllm", types.ModuleType("vllm"))
+    _install_fake_vllm_worker(monkeypatch)
     _install_fake_modelopt_tensor_quantizer(monkeypatch)
     monkeypatch.setattr(
         patch_mod,
         "apply_modelopt_nvfp4_patches",
         lambda: calls.append("patched"),
     )
-    sys.modules.pop("nemo_rl.modelopt.models.generation.vllm_quant_backend", None)
+    _clear_vllm_backend_modules(monkeypatch)
 
     importlib.import_module("nemo_rl.modelopt.models.generation.vllm_quant_backend")
 
