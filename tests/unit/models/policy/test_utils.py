@@ -23,6 +23,7 @@ import weakref
 import pytest
 import torch
 import zmq
+from pytest import MonkeyPatch
 
 from nemo_rl.models.policy.utils import (
     IPCProtocol,
@@ -38,89 +39,91 @@ from nemo_rl.models.policy.utils import (
 class TestGetMegatronCheckpointDir:
     """Test cases for the get_megatron_checkpoint_dir function."""
 
-    def test_nrl_megatron_checkpoint_dir_takes_precedence(self):
+    def test_nrl_megatron_checkpoint_dir_takes_precedence(
+        self, monkeypatch: MonkeyPatch
+    ) -> None:
         """Test that NRL_MEGATRON_CHECKPOINT_DIR environment variable takes highest precedence."""
         expected_dir = "/custom/nrl/checkpoint/path"
+        monkeypatch.setenv("NRL_MEGATRON_CHECKPOINT_DIR", expected_dir)
+        monkeypatch.setenv("HF_HOME", "/some/hf/home")
+        monkeypatch.setenv("HOME", "/some/home")
 
-        with unittest.mock.patch.dict(
-            os.environ,
-            {
-                "NRL_MEGATRON_CHECKPOINT_DIR": expected_dir,
-                "HF_HOME": "/some/hf/home",
-                "HOME": "/some/home",
-            },
-        ):
-            result = get_megatron_checkpoint_dir()
-            assert result == expected_dir
+        result = get_megatron_checkpoint_dir()
 
-    def test_hf_home_fallback_when_nrl_not_set(self):
+        assert result == expected_dir
+
+    def test_hf_home_fallback_when_nrl_not_set(
+        self, monkeypatch: MonkeyPatch
+    ) -> None:
         """Test that HF_HOME/nemo_rl is used when NRL_MEGATRON_CHECKPOINT_DIR is not set."""
         hf_home = "/path/to/hf/home"
         expected_dir = os.path.join(hf_home, "nemo_rl")
+        monkeypatch.delenv("NRL_MEGATRON_CHECKPOINT_DIR", raising=False)
+        monkeypatch.setenv("HF_HOME", hf_home)
+        monkeypatch.setenv("HOME", "/some/home")
 
-        env_vars = {"HF_HOME": hf_home, "HOME": "/some/home"}
-        # Remove NRL_MEGATRON_CHECKPOINT_DIR if it exists
-        env_vars.pop("NRL_MEGATRON_CHECKPOINT_DIR", None)
+        result = get_megatron_checkpoint_dir()
 
-        with unittest.mock.patch.dict(os.environ, env_vars, clear=True):
-            result = get_megatron_checkpoint_dir()
-            assert result == expected_dir
+        assert result == expected_dir
 
-    def test_default_fallback_when_no_env_vars_set(self):
+    def test_default_fallback_when_no_env_vars_set(
+        self, monkeypatch: MonkeyPatch
+    ) -> None:
         """Test that ~/.cache/huggingface/nemo_rl is used when no environment variables are set."""
         home_dir = "/home/testuser"
         expected_dir = os.path.join(home_dir, ".cache", "huggingface", "nemo_rl")
+        monkeypatch.delenv("NRL_MEGATRON_CHECKPOINT_DIR", raising=False)
+        monkeypatch.delenv("HF_HOME", raising=False)
+        monkeypatch.setenv("HOME", home_dir)
 
-        with unittest.mock.patch.dict(os.environ, {"HOME": home_dir}, clear=True):
-            with unittest.mock.patch("os.path.expanduser") as mock_expanduser:
-                mock_expanduser.return_value = home_dir
-                result = get_megatron_checkpoint_dir()
-                assert result == expected_dir
-                mock_expanduser.assert_called_once_with("~")
+        with unittest.mock.patch("os.path.expanduser", return_value=home_dir) as mock_expanduser:
+            result = get_megatron_checkpoint_dir()
 
-    def test_nrl_checkpoint_dir_empty_string_treated_as_unset(self):
+        assert result == expected_dir
+        mock_expanduser.assert_called_once_with("~")
+
+    def test_nrl_checkpoint_dir_empty_string_treated_as_unset(
+        self, monkeypatch: MonkeyPatch
+    ) -> None:
         """Test that an empty NRL_MEGATRON_CHECKPOINT_DIR is treated as unset."""
         hf_home = "/path/to/hf/home"
         expected_dir = os.path.join(hf_home, "nemo_rl")
+        monkeypatch.setenv("NRL_MEGATRON_CHECKPOINT_DIR", "")
+        monkeypatch.setenv("HF_HOME", hf_home)
+        monkeypatch.setenv("HOME", "/some/home")
 
-        with unittest.mock.patch.dict(
-            os.environ,
-            {
-                "NRL_MEGATRON_CHECKPOINT_DIR": "",
-                "HF_HOME": hf_home,
-                "HOME": "/some/home",
-            },
-        ):
-            result = get_megatron_checkpoint_dir()
-            assert result == expected_dir
+        result = get_megatron_checkpoint_dir()
 
-    def test_hf_home_empty_string_treated_as_unset(self):
+        assert result == expected_dir
+
+    def test_hf_home_empty_string_treated_as_unset(
+        self, monkeypatch: MonkeyPatch
+    ) -> None:
         """Test that an empty HF_HOME is treated as unset."""
         home_dir = "/home/testuser"
         expected_dir = os.path.join(home_dir, ".cache", "huggingface", "nemo_rl")
+        monkeypatch.delenv("NRL_MEGATRON_CHECKPOINT_DIR", raising=False)
+        monkeypatch.setenv("HF_HOME", "")
+        monkeypatch.setenv("HOME", home_dir)
 
-        with unittest.mock.patch.dict(
-            os.environ, {"HF_HOME": "", "HOME": home_dir}, clear=True
-        ):
-            with unittest.mock.patch("os.path.expanduser") as mock_expanduser:
-                mock_expanduser.return_value = home_dir
-                result = get_megatron_checkpoint_dir()
-                assert result == expected_dir
-
-    def test_function_prints_selected_directory(self, capsys):
-        """Test that the function prints the selected directory."""
-        expected_dir = "/custom/checkpoint/dir"
-
-        with unittest.mock.patch.dict(
-            os.environ, {"NRL_MEGATRON_CHECKPOINT_DIR": expected_dir}
-        ):
+        with unittest.mock.patch("os.path.expanduser", return_value=home_dir) as mock_expanduser:
             result = get_megatron_checkpoint_dir()
 
-            captured = capsys.readouterr()
-            assert (
-                f"Using default megatron checkpoint dir: {expected_dir}" in captured.out
-            )
-            assert result == expected_dir
+        assert result == expected_dir
+        mock_expanduser.assert_called_once_with("~")
+
+    def test_function_prints_selected_directory(
+        self, capsys: pytest.CaptureFixture[str], monkeypatch: MonkeyPatch
+    ) -> None:
+        """Test that the function prints the selected directory."""
+        expected_dir = "/custom/checkpoint/dir"
+        monkeypatch.setenv("NRL_MEGATRON_CHECKPOINT_DIR", expected_dir)
+
+        result = get_megatron_checkpoint_dir()
+
+        captured = capsys.readouterr()
+        assert f"Using default megatron checkpoint dir: {expected_dir}" in captured.out
+        assert result == expected_dir
 
 
 class _FakeIpcSocket:
