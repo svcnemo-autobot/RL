@@ -1,0 +1,15 @@
+FROM ubuntu:24.04
+RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certificates && rm -rf /var/lib/apt/lists/*
+RUN curl -LsSf https://astral.sh/uv/0.11.28/install.sh | sh
+ENV PATH="/root/.local/bin:/usr/local/bin:$PATH"
+COPY . /rl
+WORKDIR /rl
+RUN cp uv.lock /tmp/uv.lock.committed \
+ && uv python install 3.13.14 \
+ && uv lock \
+ && cp uv.lock /uv.lock.out \
+ && echo "===LOCK_SHA===" \
+ && sha256sum /tmp/uv.lock.committed uv.lock \
+ && echo "===LOCK_DIFF_BEGIN===" \
+ && (diff -u /tmp/uv.lock.committed uv.lock || true) \
+ && echo "===LOCK_DIFF_END==="
