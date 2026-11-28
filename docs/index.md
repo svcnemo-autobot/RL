@@ -335,6 +335,7 @@ guides/grpo-audio.md
 guides/grpo-audio-visual.md
 guides/rm.md
 guides/environments.md
+guides/mm-coding.md
 guides/deepseek.md
 guides/models/index.md
 model-quirks.md
@@ -399,6 +400,7 @@ design-docs/checkpoint-engines.md
 design-docs/checkpointing.md
 design-docs/loss-functions.md
 design-docs/automodel-parallel-plan.md
+design-docs/automodel-single-controller-full-batch.md
 design-docs/training-backends.md
 design-docs/sequence-packing-and-dynamic-batching.md
 design-docs/env-vars.md
@@ -410,6 +412,7 @@ design-docs/nixl-data-plane.md
 design-docs/dspark-auxiliary-heads.md
 design-docs/media-token-validity-mask.md
 design-docs/automodel-context-parallel.md
+design-docs/automodel-pipeline-parallel.md
 design-docs/token-capture-ledger.md
 design-docs/dflash-draft-body.md
 design-docs/dspark-objectives.md

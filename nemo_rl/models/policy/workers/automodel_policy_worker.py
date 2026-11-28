@@ -14,9 +14,10 @@
 
 import gc
 import warnings
-from collections.abc import Mapping
+from collections.abc import Callable, Iterator, Mapping
 from contextlib import AbstractContextManager, contextmanager, nullcontext
-from typing import Any, Generator, Iterable, Optional, cast
+from dataclasses import dataclass
+from typing import Any, Generator, Iterable, Optional, Tuple, cast
 
 import ray
 import torch
@@ -25,6 +26,7 @@ from nemo_automodel.components.distributed.tensor_utils import (
     get_cpu_state_dict,
     to_local_if_dtensor,
 )
+from nemo_automodel.components.moe.layers import Gate
 from nemo_automodel.components.training.utils import scale_grads_and_clip_grad_norm
 from nemo_automodel.shared.parameter_names import canonical_parameter_fqn
 from torch import nn
@@ -42,9 +44,21 @@ from nemo_rl.models.automodel.checkpoint import (
     build_checkpoint_config,
 )
 from nemo_rl.models.automodel.data import (
+    ProcessedMicrobatch,
     check_sequence_dim,
     get_microbatch_iterator,
     process_global_batch,
+)
+from nemo_rl.models.automodel.pipeline_parallel import (
+    ExecutionBatch,
+    PipelineWeightExporter,
+    broadcast_object_from_last_stage,
+    broadcast_tensor_from_last_stage,
+    pipeline_forward_backward,
+    pipeline_forward_logprobs,
+    pipeline_optimizer_part_ids,
+    plan_execution_batches,
+    release_pipeline_runtime_state,
 )
 from nemo_rl.models.automodel.router_replay import (
     microbatch_replay_context,
@@ -69,7 +83,7 @@ from nemo_rl.models.automodel.train import (
 )
 from nemo_rl.models.automodel.utils import release_moe_dispatcher_state
 from nemo_rl.models.megatron.router_replay import router_replay_enabled
-from nemo_rl.models.policy import PolicyConfig
+from nemo_rl.models.policy import AutomodelConfig, PolicyConfig
 from nemo_rl.models.policy.interfaces import (
     ColocatablePolicyInterface,
     LogprobOutputSpec,
@@ -99,6 +113,18 @@ from nemo_rl.utils.nsys import wrap_with_nvtx_name
 from nemo_rl.utils.packed_tensor import packed_broadcast_producer
 from nemo_rl.utils.tensor_ops import pad_and_concat
 from nemo_rl.utils.timer import Timer
+
+
+@dataclass
+class _TrainStepState:
+    """State owned by one SC optimizer step, independently of synchronous train."""
+
+    loss_fn: LossFunction
+    gbs: int
+    mbs: int
+    router_loads: list[tuple[Gate, Optional[torch.Tensor]]]
+    dispatched: bool = False
+    metrics: Optional[dict[str, Any]] = None
 
 
 def _refit_tensor_dtype(
@@ -443,13 +469,14 @@ class AutomodelPolicyWorkerImpl(
             return f"{self.__class__.__qualname__}"
 
     def _get_replica_group(self) -> Optional[Any]:
-        """Replica group = flattened (cp, tp) sub-mesh — see V1 worker."""
-        return self.device_mesh[("cp", "tp")]._flatten().get_group()
+        """Group sharing input data and one TQ write-back leader within a DP rank."""
+        return self.device_mesh[("pp", "cp", "tp")]._flatten().get_group()
 
     def _local_coords(self) -> dict[str, int]:
         return {
             "tensor_parallel": self.device_mesh["tp"].get_local_rank(),
             "context_parallel": self.device_mesh["cp"].get_local_rank(),
+            "pipeline_parallel": self.device_mesh["pp"].get_local_rank(),
         }
 
     @traced_worker_init("rl.policy.load_model", **{"rl.backend": "automodel"})
@@ -534,10 +561,13 @@ class AutomodelPolicyWorkerImpl(
         # Set instance attributes from distributed context
         self.rank = torch.distributed.get_rank()
         self.timer = Timer(context={"worker": "automodel_policy", "rank": self.rank})
+        self._train_step_state: Optional[_TrainStepState] = None
+        self._train_step_commit_failed = False
         self.device_mesh = distributed_context.device_mesh
         self.dp_mesh = self.device_mesh["dp"]
         self.tp_mesh = self.device_mesh["tp"]
         self.cp_mesh = self.device_mesh["cp"]
+        self.pp_mesh = self.device_mesh["pp"]
         self.moe_mesh = distributed_context.moe_mesh
         self.dp_size = distributed_context.dp_size
         self.tp_size = distributed_context.tp_size
@@ -593,6 +623,7 @@ class AutomodelPolicyWorkerImpl(
         # Set instance attributes from model and optimizer state. Access by
         # field name (not positional unpacking) so optional fields appended to
         # ModelAndOptimizerState stay backward compatible across workers.
+        self.pipeline = model_and_optimizer_state.pipeline
         self.model = model_and_optimizer_state.model
         self.optimizer = model_and_optimizer_state.optimizer
         self.scheduler = model_and_optimizer_state.scheduler
@@ -634,6 +665,15 @@ class AutomodelPolicyWorkerImpl(
         if init_reference_model:
             self.reference_model_state_dict = setup_reference_model_state(self.model)
 
+        self._weight_exporter = (
+            PipelineWeightExporter(
+                self.pipeline,
+                local_params=lambda: _module_params_generator(self.model, self.dtype),
+            )
+            if self.pipeline is not None
+            else None
+        )
+
         if defer_checkpoint_load:
             self.load_checkpoint(weights_path, optimizer_path)
 
@@ -660,6 +700,14 @@ class AutomodelPolicyWorkerImpl(
         if update_moe_gate_bias is not None:
             update_moe_gate_bias()
 
+    def _raise_if_pipeline_parallel(self, feature: str) -> None:
+        """Reject a worker feature that has no pipeline-parallel implementation."""
+        if self.pipeline is not None:
+            raise NotImplementedError(
+                f"{feature} is not supported with "
+                "policy.automodel_cfg.pipeline_parallel_size > 1."
+            )
+
     def _autocast_context(self) -> AbstractContextManager[Any]:
         """Return the worker-owned precision context for one microbatch."""
         if not self.autocast_enabled:
@@ -669,6 +717,82 @@ class AutomodelPolicyWorkerImpl(
     def set_rollout_num_gpus_per_engine(self, num_gpus_per_engine: int) -> None:
         """Record the rollout engine's TP size for later use by weight-streaming refit."""
         self._rollout_num_gpus_per_engine = num_gpus_per_engine
+
+    def _make_loss_post_processor(
+        self, loss_fn: LossFunction, *, draft_runtime: Optional[Any]
+    ) -> LossPostProcessor:
+        """Build the loss post-processor shared by ``train`` and the SC step."""
+        return LossPostProcessor(
+            loss_fn=loss_fn,
+            cfg=self.cfg,
+            cp_mesh=self.cp_mesh,
+            cp_size=self.cp_size,
+            dp_size=self.dp_size,
+            enable_seq_packing=self.enable_seq_packing,
+            sampling_params=self.sampling_params,
+            draft_runtime=draft_runtime,
+            tp_mesh=self.tp_mesh,
+        )
+
+    def _forward_backward(
+        self,
+        data_iterator: Iterator[ProcessedMicrobatch],
+        loss_post_processor: LossPostProcessor,
+        *,
+        forward_only: bool,
+        global_valid_seqs: torch.Tensor,
+        global_valid_toks: torch.Tensor,
+        sequence_dim: int,
+        num_global_batches: int,
+        num_valid_microbatches: int,
+        on_microbatch_start: Callable[[int], None],
+    ) -> list[Tuple[Any, dict[str, Any]]]:
+        """Run one global batch's microbatches with this worker's model wiring."""
+        return automodel_forward_backward(
+            model=self.model,
+            data_iterator=data_iterator,
+            post_processing_fn=loss_post_processor,
+            device_mesh=self.device_mesh,
+            padding_token_id=self.tokenizer.pad_token_id or 0,
+            autocast_context_factory=self._autocast_context,
+            forward_only=forward_only,
+            allow_flash_attn_args=self.allow_flash_attn_args,
+            global_valid_seqs=global_valid_seqs,
+            global_valid_toks=global_valid_toks,
+            sampling_params=self.sampling_params,
+            sequence_dim=sequence_dim,
+            dp_size=self.dp_size,
+            cp_size=self.cp_size,
+            num_global_batches=num_global_batches,
+            num_valid_microbatches=num_valid_microbatches,
+            on_microbatch_start=on_microbatch_start,
+            router_replay_gates=self._router_replay_gates,
+        )
+
+    def _clip_policy_grad_norm(self) -> torch.Tensor:
+        """Clip the policy's gradients and return the pre-clip norm on CPU.
+
+        num_label_tokens=None avoids rescaling gradients already normalized by
+        the loss.
+        """
+        grad_norm = scale_grads_and_clip_grad_norm(
+            self.max_grad_norm,
+            [self.model],
+            norm_type=2.0,
+            pp_enabled=self.pipeline is not None,
+            device_mesh=self.device_mesh,
+            moe_mesh=self.moe_mesh,
+            ep_axis_name="ep"
+            if self.moe_mesh is not None and "ep" in self.moe_mesh.mesh_dim_names
+            else None,
+            pp_axis_name="pp" if self.pipeline is not None else None,
+            foreach=True,
+            num_label_tokens=None,
+            dp_group_size=self.dp_size * self.cp_size,
+        )
+        grad_norm = torch.tensor(grad_norm, device="cpu", dtype=torch.float32)
+        warn_if_inf_grad_norm(grad_norm)
+        return grad_norm
 
     @wrap_with_nvtx_name("automodel_policy_worker/train")
     def train(
@@ -713,16 +837,8 @@ class AutomodelPolicyWorkerImpl(
                 self.draft_model.train()
 
         # Create loss post-processor
-        loss_post_processor = LossPostProcessor(
-            loss_fn=loss_fn,
-            cfg=self.cfg,
-            cp_mesh=self.cp_mesh,
-            cp_size=self.cp_size,
-            dp_size=self.dp_size,
-            enable_seq_packing=self.enable_seq_packing,
-            sampling_params=self.sampling_params,
-            draft_runtime=draft_runtime,
-            tp_mesh=self.tp_mesh,
+        loss_post_processor = self._make_loss_post_processor(
+            loss_fn, draft_runtime=draft_runtime
         )
 
         # Setup cache clearing callback if configured
@@ -759,36 +875,46 @@ class AutomodelPolicyWorkerImpl(
 
                 self.optimizer.zero_grad()
 
-                # Get microbatch iterator based on batching strategy
-                processed_iterator, iterator_len = get_microbatch_iterator(
-                    batch,
-                    self.cfg,
-                    mbs,
-                    self.dp_mesh,
-                    tokenizer=self.tokenizer,
-                )
+                if self.pipeline is not None:
+                    execution_batches = self._plan_execution_batches(batch, mbs)
+                    mb_results = pipeline_forward_backward(
+                        self.pipeline,
+                        execution_batches,
+                        loss_post_processor,
+                        autocast_context_factory=self._autocast_context,
+                        forward_only=eval_mode,
+                        global_valid_seqs=global_valid_seqs,
+                        global_valid_toks=global_valid_toks,
+                        sampling_params=self.sampling_params,
+                        sequence_dim=sequence_dim,
+                        dp_size=self.dp_size,
+                        cp_size=self.cp_size,
+                        num_global_batches=num_global_batches,
+                    )
+                    iterator_len = sum(
+                        execution_batch.num_real_microbatches
+                        for execution_batch in execution_batches
+                    )
+                else:
+                    processed_iterator, iterator_len = get_microbatch_iterator(
+                        batch,
+                        cast(dict[str, Any], self.cfg),
+                        mbs,
+                        self.dp_mesh,
+                        tokenizer=self.tokenizer,
+                    )
 
-                # Use automodel_forward_backward for the training loop
-                mb_results = automodel_forward_backward(
-                    model=self.model,
-                    data_iterator=processed_iterator,
-                    post_processing_fn=loss_post_processor,
-                    device_mesh=self.device_mesh,
-                    padding_token_id=self.tokenizer.pad_token_id or 0,
-                    autocast_context_factory=self._autocast_context,
-                    forward_only=eval_mode,
-                    allow_flash_attn_args=self.allow_flash_attn_args,
-                    global_valid_seqs=global_valid_seqs,
-                    global_valid_toks=global_valid_toks,
-                    sampling_params=self.sampling_params,
-                    sequence_dim=sequence_dim,
-                    dp_size=self.dp_size,
-                    cp_size=self.cp_size,
-                    num_global_batches=num_global_batches,
-                    num_valid_microbatches=iterator_len,
-                    on_microbatch_start=on_microbatch_start,
-                    router_replay_gates=self._router_replay_gates,
-                )
+                    mb_results = self._forward_backward(
+                        processed_iterator,
+                        loss_post_processor,
+                        forward_only=eval_mode,
+                        global_valid_seqs=global_valid_seqs,
+                        global_valid_toks=global_valid_toks,
+                        sequence_dim=sequence_dim,
+                        num_global_batches=num_global_batches,
+                        num_valid_microbatches=iterator_len,
+                        on_microbatch_start=on_microbatch_start,
+                    )
 
                 # Extract losses and metrics from results
                 mb_losses = []
@@ -817,32 +943,13 @@ class AutomodelPolicyWorkerImpl(
                             mb_losses.append(loss_metrics["loss"] * num_global_batches)
                             all_mb_metrics.append(loss_metrics)
 
-                grad_norm: Optional[float | torch.Tensor] = None
+                grad_norm: Optional[torch.Tensor] = None
                 if not eval_mode:
                     # The policy is clipped on its own (Megatron-path parity):
                     # a shared global clip let the draft's larger gradients
                     # scale down the policy's updates on every step. The draft
                     # is clipped separately below.
-                    grad_norm = scale_grads_and_clip_grad_norm(
-                        self.max_grad_norm,
-                        [self.model],
-                        norm_type=2.0,
-                        pp_enabled=False,
-                        device_mesh=self.device_mesh,
-                        moe_mesh=self.moe_mesh,
-                        ep_axis_name="ep"
-                        if self.moe_mesh is not None
-                        and "ep" in self.moe_mesh.mesh_dim_names
-                        else None,
-                        pp_axis_name=None,
-                        foreach=True,
-                        num_label_tokens=1,
-                        dp_group_size=self.dp_size * self.cp_size,
-                    )
-                    grad_norm = torch.tensor(
-                        grad_norm, device="cpu", dtype=torch.float32
-                    )
-                    warn_if_inf_grad_norm(grad_norm)
+                    grad_norm = self._clip_policy_grad_norm()
 
                     # Independent draft clip with the same max norm; the
                     # returned pre-clip norm doubles as the reported metric.
@@ -868,6 +975,11 @@ class AutomodelPolicyWorkerImpl(
                     self._update_moe_gate_bias_if_supported()
 
                 losses.append(torch.tensor(mb_losses).sum().item())
+
+            if self.pipeline is not None:
+                losses, all_mb_metrics = broadcast_object_from_last_stage(
+                    self.pipeline, (losses, all_mb_metrics)
+                )
 
             # release gradient memory before rollouts
             self.optimizer.zero_grad()
@@ -896,6 +1008,168 @@ class AutomodelPolicyWorkerImpl(
 
             self.timer.stop("train")
             return metrics
+
+    def begin_train_step(
+        self,
+        loss_fn: LossFunction,
+        gbs: Optional[int] = None,
+        mbs: Optional[int] = None,
+    ) -> None:
+        """Open an SC step, retaining ownership until finish or abort."""
+        if self._train_step_commit_failed:
+            raise RuntimeError("SC commit failed; restart the run from a checkpoint")
+        if self._train_step_state is not None:
+            raise RuntimeError("a train step is already open; finish or abort it first")
+        if self.optimizer is None or self.scheduler is None:
+            raise RuntimeError("an SC step requires an optimizer and scheduler")
+        batch_size = self.cfg["train_global_batch_size"] if gbs is None else gbs
+        micro_batch_size = self.cfg["train_micro_batch_size"] if mbs is None else mbs
+        if (
+            batch_size <= 0
+            or micro_batch_size <= 0
+            or batch_size % (self.dp_size * micro_batch_size) != 0
+        ):
+            raise ValueError("GBS must be positive and divisible by DP size × MBS")
+        state = _TrainStepState(
+            loss_fn=loss_fn,
+            gbs=batch_size,
+            mbs=micro_batch_size,
+            # AutoModel Gate keeps this training accumulator outside state_dict.
+            router_loads=[
+                (
+                    module,
+                    module._cumulative_expert_load.detach().clone()
+                    if module._cumulative_expert_load is not None
+                    else None,
+                )
+                for module in self.model.modules()
+                if isinstance(module, Gate)
+            ],
+        )
+        self.optimizer.zero_grad()
+        self.model.train()
+        self._train_step_state = state
+
+    def train_microbatch(self, data: BatchedDataDict[Any]) -> None:
+        """Compute a full dispatch's gradients using existing numerical primitives.
+
+        One dispatch may contain many backend forward/backward microbatches.
+        Requires exactly one complete batch; streaming is not supported.
+        """
+        state = self._train_step_state
+        if state is None:
+            raise RuntimeError("begin_train_step must precede train_microbatch")
+        if state.dispatched:
+            raise RuntimeError(
+                "AutoModel SC accepts exactly one full-batch dispatch per step"
+            )
+        state.dispatched = True
+        sizes = torch.tensor([data.size, -data.size], device="cuda")
+        torch.distributed.all_reduce(
+            sizes, op=torch.distributed.ReduceOp.MIN, group=self.dp_mesh.get_group()
+        )
+        minimum, negative_maximum = sizes.tolist()
+        local_gbs = state.gbs // self.dp_size
+        if minimum != local_gbs or -negative_maximum != local_gbs:
+            raise ValueError(
+                f"AutoModel SC requires {local_gbs} rows on every DP rank; "
+                f"received between {minimum} and {-negative_maximum}. Abort this step."
+            )
+        with self.timer.time("train"):
+            sequence_dim, _ = check_sequence_dim(data)
+            self.model.train()
+            loss_post_processor = self._make_loss_post_processor(
+                state.loss_fn, draft_runtime=None
+            )
+            # The full-batch path runs only with AutoModel enabled, so the
+            # disabled variant of the union cannot occur here.
+            automodel_cfg = cast(AutomodelConfig, self.cfg["automodel_cfg"])
+            empty_cache_steps = automodel_cfg.get("clear_cache_every_n_steps")
+
+            def on_microbatch_start(mb_idx: int) -> None:
+                if empty_cache_steps and mb_idx % empty_cache_steps == 0:
+                    torch.cuda.empty_cache()
+
+            gb_result = process_global_batch(
+                data.to("cuda"),
+                state.loss_fn,
+                self.dp_mesh.get_group(),
+                batch_idx=0,
+                batch_size=local_gbs,
+            )
+            global_valid_seqs = gb_result["global_valid_seqs"]
+            global_valid_toks = gb_result["global_valid_toks"]
+            processed_iterator, iterator_len = get_microbatch_iterator(
+                gb_result["batch"],
+                cast(dict[str, Any], self.cfg),
+                state.mbs,
+                self.dp_mesh,
+                tokenizer=self.tokenizer,
+            )
+            mb_results = self._forward_backward(
+                processed_iterator,
+                loss_post_processor,
+                forward_only=False,
+                global_valid_seqs=global_valid_seqs,
+                global_valid_toks=global_valid_toks,
+                sequence_dim=sequence_dim,
+                num_global_batches=1,
+                num_valid_microbatches=iterator_len,
+                on_microbatch_start=on_microbatch_start,
+            )
+            mb_losses = []
+            all_mb_metrics = []
+            for mb_idx, (_, loss_metrics) in enumerate(mb_results):
+                if mb_idx < iterator_len:
+                    loss_metrics[LEARNING_RATE_KEY] = self.optimizer.param_groups[0][
+                        "lr"
+                    ]
+                    loss_metrics["global_valid_seqs"] = global_valid_seqs.item()
+                    loss_metrics["global_valid_toks"] = global_valid_toks.item()
+                    if loss_metrics["num_valid_samples"] > 0:
+                        mb_losses.append(loss_metrics["loss"])
+                        all_mb_metrics.append(loss_metrics)
+            state.metrics = aggregate_training_statistics(
+                losses=[torch.tensor(mb_losses).sum().item()],
+                all_mb_metrics=all_mb_metrics,
+                grad_norm=None,
+                dp_group=self.dp_mesh.get_group(),
+                dtype=self.dtype,
+            )
+
+    def finish_train_step(self) -> dict[str, Any]:
+        """Commit one update; a failed commit requires checkpoint recovery."""
+        state = self._train_step_state
+        if state is None or state.metrics is None:
+            raise RuntimeError("finish requires one successfully completed full batch")
+        # Keep the fence raised until cleanup also succeeds: a failure after
+        # optimizer.step still leaves the caller unsure whether it committed.
+        self._train_step_commit_failed = True
+        try:
+            self.model.train()
+            grad_norm = self._clip_policy_grad_norm()
+            self.optimizer.step()
+            self._update_moe_gate_bias_if_supported()
+            self.scheduler.step()
+            state.metrics["grad_norm"] = grad_norm
+        finally:
+            self._train_step_state = None
+            self.optimizer.zero_grad()
+            release_moe_dispatcher_state(self.model)
+            torch.cuda.empty_cache()
+        self._train_step_commit_failed = False
+        return state.metrics
+
+    def abort_train_step(self) -> None:
+        """Discard gradients and restore router loads without committing an update."""
+        state = self._train_step_state
+        if state is None:
+            return
+        for gate, load in state.router_loads:
+            gate._cumulative_expert_load = load
+        self.optimizer.zero_grad()
+        release_moe_dispatcher_state(self.model)
+        self._train_step_state = None
 
     @wrap_with_nvtx_name("automodel_policy_worker/get_logprobs")
     def get_logprobs(
@@ -937,6 +1211,18 @@ class AutomodelPolicyWorkerImpl(
             enable_seq_packing=self.enable_seq_packing,
             sampling_params=self.sampling_params,
         )
+
+        if self.pipeline is not None:
+            return_data = BatchedDataDict[LogprobOutputSpec]()
+            return_data["logprobs"] = self._get_pipeline_logprobs(
+                data,
+                logprobs_post_processor,
+                micro_batch_size=logprob_batch_size,
+                sequence_dim=sequence_dim,
+                seq_dim_size=seq_dim_size,
+            ).cpu()
+            self.timer.stop("get_logprobs")
+            return return_data
 
         with torch.no_grad():
             data.to("cuda")
@@ -995,8 +1281,69 @@ class AutomodelPolicyWorkerImpl(
         self.timer.stop("get_logprobs")
         return return_data
 
+    def _plan_execution_batches(
+        self, data: BatchedDataDict[Any], micro_batch_size: int
+    ) -> list[ExecutionBatch]:
+        """Split this rank's ``data`` into the pipeline's schedule calls."""
+        pipeline = self.pipeline
+        if micro_batch_size != pipeline.pp_microbatch_size:
+            raise ValueError(
+                "Pipeline parallelism runs microbatches of "
+                f"{pipeline.pp_microbatch_size} samples "
+                "(policy.train_micro_batch_size), but this call requested "
+                f"micro_batch_size={micro_batch_size}."
+            )
+        return plan_execution_batches(
+            data,
+            model=self.model,
+            micro_batch_size=micro_batch_size,
+            microbatches_per_step=pipeline.pp_batch_size // pipeline.pp_microbatch_size,
+            dp_group=self.dp_mesh.get_group(),
+            tokenizer=self.tokenizer,
+            cfg=cast(dict[str, Any], self.cfg),
+            allow_flash_attn_args=self.allow_flash_attn_args,
+            device_mesh=self.device_mesh,
+            cp_size=self.cp_size,
+            padding_token_id=self.tokenizer.pad_token_id or 0,
+        )
+
+    @torch.no_grad()
+    def _get_pipeline_logprobs(
+        self,
+        data: BatchedDataDict[Any],
+        post_processing_fn: LogprobsPostProcessor,
+        *,
+        micro_batch_size: int,
+        sequence_dim: int,
+        seq_dim_size: int,
+    ) -> torch.Tensor:
+        """Compute logprobs [data.size, seq_dim_size] and broadcast them to all PP ranks."""
+        pipeline = self.pipeline
+        data.to("cuda")
+        execution_batches = self._plan_execution_batches(data, micro_batch_size)
+        token_logprobs = pipeline_forward_logprobs(
+            pipeline,
+            execution_batches,
+            post_processing_fn,
+            autocast_context_factory=self._autocast_context,
+            sampling_params=self.sampling_params,
+            sequence_dim=sequence_dim,
+        )
+        local_logprobs = None
+        if pipeline.info.has_last_stage:
+            local_logprobs = pad_and_concat(token_logprobs, target_len=seq_dim_size)[
+                : data.size
+            ]
+        return broadcast_tensor_from_last_stage(
+            pipeline,
+            local_logprobs,
+            shape=(data.size, seq_dim_size),
+            dtype=torch.float32,
+        )
+
     @wrap_with_nvtx_name("automodel_policy_worker/score")
     def score(self, data: BatchedDataDict) -> BatchedDataDict[ScoreOutputSpec]:
+        self._raise_if_pipeline_parallel("Reward model scoring")
         global_batch_size = min(self.cfg["batch_size"], data.size)
 
         # Validate sequence dimension
@@ -1074,6 +1421,7 @@ class AutomodelPolicyWorkerImpl(
         - Supports context parallelism with proper CP gather.
         - Otherwise, computes local top-k on full-vocab tensor.
         """
+        self._raise_if_pipeline_parallel("get_topk_logits")
         topk_batch_size = (
             micro_batch_size
             if micro_batch_size is not None
@@ -1163,6 +1511,7 @@ class AutomodelPolicyWorkerImpl(
         (``vocab_start_index``, ``global_seq_start``, ...) the consumer uses to
         route shards across heterogeneous teacher/student TP/CP.
         """
+        self._raise_if_pipeline_parallel("get_full_logits_ipc")
         forward_batch_size = (
             micro_batch_size
             if micro_batch_size is not None
@@ -1358,6 +1707,8 @@ class AutomodelPolicyWorkerImpl(
     @torch.no_grad()
     def prepare_refit_info(self) -> Optional[dict[str, Any]]:
         """Prepare state dict metadata for weight refitting and IPC streaming."""
+        if self._weight_exporter is not None:
+            return self._weight_exporter.refit_info()
         if self.lora_enabled and self.lora_refit_mode == "native":
             return {
                 name: (tensor.shape, tensor.dtype)
@@ -1393,6 +1744,20 @@ class AutomodelPolicyWorkerImpl(
 
         return state_dict_info
 
+    def _iter_refit_params(
+        self, *, include_draft: bool
+    ) -> Generator[tuple[str, torch.Tensor], None, None]:
+        """Yield full-model refit weights, with or without pipeline parallelism."""
+        if self._weight_exporter is not None:
+            assert self.draft_model is None
+            yield from self._weight_exporter.iter_params()
+            return
+        yield from automodel_params_generator(
+            self.model,
+            self.dtype,
+            draft_model=self.draft_model if include_draft else None,
+        )
+
     def _refit_params_generator(
         self,
     ) -> Generator[tuple[str, torch.Tensor], None, None]:
@@ -1400,9 +1765,7 @@ class AutomodelPolicyWorkerImpl(
         if self.lora_enabled and self.lora_refit_mode == "native":
             yield from automodel_lora_params_generator(self.model, self.dtype)
             return
-        yield from automodel_params_generator(
-            self.model, self.dtype, draft_model=self.draft_model
-        )
+        yield from self._iter_refit_params(include_draft=True)
 
     @torch.no_grad()
     def calibrate_qkv_fp8_scales(
@@ -1481,7 +1844,7 @@ class AutomodelPolicyWorkerImpl(
         )
 
         bucket_iter = iter_named_tensor_buckets(
-            automodel_params_generator(self.model, self.dtype),
+            self._iter_refit_params(include_draft=False),
             buffer_size_bytes=buffer_size_bytes,
         )
         send_hf_buckets_via_ipc_actor_impl(
@@ -1493,9 +1856,7 @@ class AutomodelPolicyWorkerImpl(
     def _checkpoint_engine_params(
         self,
     ) -> Generator[tuple[str, torch.Tensor], None, None]:
-        return automodel_params_generator(
-            self.model, self.dtype, draft_model=self.draft_model
-        )
+        return self._iter_refit_params(include_draft=True)
 
     @torch.no_grad()
     def broadcast_weights_for_collective(
@@ -1638,6 +1999,8 @@ class AutomodelPolicyWorkerImpl(
         if self.optimizer is not None:
             self.move_optimizer_to_device("cpu")
 
+        if self.pipeline is not None:
+            release_pipeline_runtime_state(self.pipeline)
         # Release recompute activations that MoE dispatch state keeps alive;
         # otherwise they pin cached segments and empty_cache() cannot free them.
         release_moe_dispatcher_state(self.model)
@@ -1734,6 +2097,7 @@ class AutomodelPolicyWorkerImpl(
                 tokenizer_path=tokenizer_path,
                 is_final_checkpoint=is_final_checkpoint,
                 peft_config=self.peft_config,
+                optimizer_part_ids=pipeline_optimizer_part_ids(self.pipeline),
             )
 
     def finalize_async_save(self) -> None:
@@ -1776,6 +2140,7 @@ class AutomodelPolicyWorkerImpl(
                 optimizer=self.optimizer,
                 optimizer_path=optimizer_path,
                 scheduler=self.scheduler,
+                optimizer_part_ids=pipeline_optimizer_part_ids(self.pipeline),
             )
 
     def _init_checkpoint_manager(
@@ -1795,6 +2160,7 @@ class AutomodelPolicyWorkerImpl(
                 dp_mesh=self.dp_mesh,
                 tp_mesh=self.tp_mesh,
                 moe_mesh=self.moe_mesh,
+                pp_mesh=self.pp_mesh,
             )
             self.checkpoint_manager.init_checkpointer(
                 config_updates=config_updates,
